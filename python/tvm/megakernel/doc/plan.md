@@ -1,30 +1,55 @@
 ---
-name: torch-megakernel-partition-event
-description: Analyze a staged Torch program or operator graph and output only the Stage 1 megakernel tile partition and logical event dependency plan. Use when converting high-level staged computation into megakernel planning YAML before KernelSpec, Relax, TIRX, CUDA, or runtime lowering.
+name: megakernel-partition-event
+description: >
+  Analyze a staged computation description and output only the Stage 1
+  megakernel tile partition and logical event dependency plan. Use when
+  converting high-level staged computation into a megakernel DSL plan before
+  TileImpl authoring, validation, and TIRX megakernel lowering.
 ---
 
-# Torch Megakernel Partition/Event Planner
+# Megakernel Partition/Event Planner
 
 ## Task
 
-Given a staged Torch program, produce a Stage 1 megakernel plan.
+Given a staged computation description, produce the Stage 1 megakernel plan.
 
-The output is a logical planning artifact. It describes tile stages, tensor flow, event tensors, and wait/notify coordinate mappings. It must not describe low-level event implementation.
+This plan is Step 2 of the megakernel DSL workflow.  The agent should
+plan tile partitioning and logical event dependencies.  The output should be
+sufficient for a user or agent to write the megakernel DSL in the next step.
+
+The plan describes:
+
+```text
+1. tile stages
+2. tile instance spaces
+3. tensor flow between stages
+4. logical events
+5. wait/notify coordinate mappings
+```
+
+It must not describe low-level event implementation or tile implementation
+bodies.
 
 ## Inputs
 
 The user may provide any of these:
 
 ```text
-1. Torch-like staged Python code
-2. an operator graph
-3. a written staged dataflow description
-4. shape and block-size symbols for an existing workload
+1. natural language staged computation description
+2. Torch-like staged Python code
+3. pseudocode
+4. an operator graph
+5. a written staged dataflow description
+6. shape and block-size symbols for an existing workload
 ```
 
-Preserve the staged dataflow. Do not collapse separate user-visible stages into one mathematically equivalent operation unless the user explicitly asks for fusion beyond the given stages.
+Preserve the staged dataflow.  Do not collapse separate user-visible stages
+into one mathematically equivalent operation unless the user explicitly asks for
+fusion beyond the given stages.
 
-If dimensions, block sizes, or split factors are missing, introduce symbolic names such as `NUM_BLOCK_M`, `NUM_BLOCK_N`, `SPLIT_K`, or `NUM_HEADS` instead of inventing numeric constants.
+If dimensions, block sizes, or split factors are missing, introduce symbolic
+names such as `x` instead of
+inventing numeric constants.
 
 ## Output Contract
 
@@ -40,14 +65,15 @@ dependencies: []
 validation: {}
 ```
 
-Do not output CUDA, TIRX, Relax, Python `KernelSpec`, atomic operations, spin waits, memory fences, or encoded event-counter formulas.
+Do not output CUDA, TIRX, Python `KernelSpec`, `TileImpl` bodies, atomic
+operations, spin waits, memory fences, or encoded event-counter formulas.
 
 ## YAML Schema
 
 ```yaml
 tiles:
   <tile_name>:
-    torch_stage: <source stage or expression>
+    source_stage: <source stage or expression>
     purpose: <short description of local computation>
     tile_impl: <suggested TileImpl class name or null>
     tile_num: [<m_tiles>, <n_tiles>, <k_tiles>]
@@ -55,7 +81,6 @@ tiles:
     reads: [<tensor_name>, ...]
     writes: [<tensor_name>, ...]
 
-# Include user inputs, intermediates, and outputs.
 tensors:
   <tensor_name>:
     role: input | intermediate | output
@@ -64,7 +89,6 @@ tensors:
     shape: <shape_or_symbolic_shape_or_null>
     dtype: <dtype_or_null>
 
-# Events represent logical readiness only.
 events:
   <event_name>:
     kind: count
@@ -97,24 +121,31 @@ validation:
     - <only include if needed to make the plan actionable>
 ```
 
-For one-to-one dependencies, `event` may be `null` only if no asynchronous readiness event is required by the target scheduler. Otherwise emit an event with `init: 1`.
+The YAML is a planning artifact, not the final Python DSL.  In Step 3 of the
+workflow, use [dsl_api.md](dsl_api.md) as the API reference.
+`events.<name>.init` maps naturally to `EventSpec.init_count`, and each
+wait/notify entry maps to `TileSpec.wait(...)` or `TileSpec.notify(...)`.
+
+For one-to-one dependencies, `event` may be `null` only if no logical readiness
+event is required.  Otherwise emit an event with `init: 1`.
 
 ## Planning Procedure
 
 1. Identify staged operations in the same order as the input.
 2. Assign one logical tile stage per preserved stage.
-3. Pick `tile_num` using `[m, n, k]` axes. Use extent `1` for unused axes.
+3. Pick `tile_num` using `[m, n, k]` axes.  Use extent `1` for unused axes.
 4. Record reads and writes for every tile.
 5. Build tensor producer/consumer metadata.
-6. For every producer-consumer edge, classify dependency multiplicity.
-7. Create events for non-one-to-one dependencies, especially many-to-one readiness.
-8. Define notify and wait coordinate maps in consumer-visible logical coordinates.
+6. Classify producer-consumer dependency multiplicity.
+7. Create events for dependencies that need logical readiness tracking.
+8. Define notify and wait coordinate maps.
 9. Validate rank, multiplicity, and staged dataflow preservation.
 10. Return YAML only.
 
 ## Dependency Rules
 
-Use a count event when several producer tile instances must finish before one consumer tile instance can run.
+Use a count event when several producer tile instances must finish before one
+consumer tile instance can run.
 
 Example pattern:
 
@@ -150,21 +181,19 @@ dependencies:
       expected: NUM_BLOCK_N
 ```
 
-The rank of `notify.coord_map` and `wait.coord_map` must equal the rank of `events.<event>.shape`.
+The rank of `notify.coord_map` and `wait.coord_map` must equal the rank of
+`events.<event>.shape`.
 
-`wait.expected` must equal the number of producer tile instances mapped to the same event coordinate.
+`wait.expected` must equal the number of producer tile instances mapped to the
+same event coordinate.
 
 ## What Not To Emit
 
-Never expose low-level implementation details in Stage 1 output:
+Never expose low-level implementation details in Stage 1 output like:
 
 ```text
-EVENT_BASE
 atomic add/sub
-red.async
-ld_global_acquire
 spin wait loops
-nano_sleep
 CTA role split
 shared memory layout
 TIRX function bodies
@@ -187,7 +216,7 @@ Output:
 ```yaml
 tiles:
   stage1_partial_reduce:
-    torch_stage: B = reduce_n_blocks(A)
+    source_stage: B = reduce_n_blocks(A)
     purpose: reduce each A[m-block, n-block] into B[m-block, n]
     tile_impl: Stage1ReduceTile
     tile_num: [NUM_BLOCK_M, NUM_BLOCK_N, 1]
@@ -196,7 +225,7 @@ tiles:
     writes: [B]
 
   stage2_final_reduce:
-    torch_stage: C = reduce_block_results(B)
+    source_stage: C = reduce_block_results(B)
     purpose: reduce all partial values for each m-block
     tile_impl: Stage2ReduceTile
     tile_num: [NUM_BLOCK_M, 1, 1]

@@ -16,13 +16,30 @@
 # under the License.
 """Megakernel DSL building blocks."""
 
-from .base import DepSpec, EventSpec, KernelSpec, TensorSpec, TileImpl, TileSpec
+from .impl import TileImpl
+from .spec import (
+    CoordMapType,
+    DependencySpec,
+    EventSpec,
+    ExprLike,
+    KernelSpec,
+    ShapeType,
+    TensorSpec,
+    TileNumType,
+    TileSpec,
+    VarSpec,
+)
 
 __all__ = [
-    "DepSpec",
+    "CoordMapType",
+    "DependencySpec",
     "EventSpec",
+    "ExprLike",
     "KernelSpec",
+    "ShapeType",
     "TensorSpec",
     "TileImpl",
+    "TileNumType",
     "TileSpec",
+    "VarSpec",
 ]

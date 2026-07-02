@@ -3,7 +3,8 @@ from tvm.tirx.script import tile as Tx
 
 from tvm.megakernel.dsl import KernelSpec, TileImpl
 
-# Configeration parameters
+
+# Configuration parameters
 M = 1024
 N = 1024
 
@@ -14,34 +15,35 @@ NUM_BLOCK_M = M // BLOCK_M
 NUM_BLOCK_N = N // BLOCK_N
 
 
-class Stage1ReduceTile(TileImpl):
+# ============================================================
+# Lower DSL layer: tile implementations
+# ============================================================
 
-    def __init__(self, A, B, *, BLOCK_M, BLOCK_N):
+
+class Stage1ReduceTile(TileImpl):
+    """Reduce one A[m-block, n-block] tile into B[m-block, n]."""
+
+    def __init__(self, A, B, *, block_m, block_n):
         super().__init__()
         self.A = A
         self.B = B
-        self.BLOCK_M = BLOCK_M
-        self.BLOCK_N = BLOCK_N
+        self.block_m = block_m
+        self.block_n = block_n
 
         self.A_smem = None
         self.P_smem = None
 
-    def init(self, smem_manager):
-        self.A_smem = smem_manager.alloc(
-            (self.BLOCK_M, self.BLOCK_N),
-            "float32",
-        )
-        self.P_smem = smem_manager.alloc(
-            (self.BLOCK_M, 1),
-            "float32",
-        )
+    def device_init(self):
+        # The concrete allocation API is selected by the later lowering pass.
+        self.A_smem = T.alloc_buffer((self.block_m, self.block_n), "float32", scope="shared")
+        self.P_smem = T.alloc_buffer((self.block_m, 1), "float32", scope="shared")
 
     def run(self, m_idx, n_idx, k_idx):
         Tx.copy(
             self.A_smem,
             self.A[
-                m_idx * self.BLOCK_M : (m_idx + 1) * self.BLOCK_M,
-                n_idx * self.BLOCK_N : (n_idx + 1) * self.BLOCK_N,
+                m_idx * self.block_m : (m_idx + 1) * self.block_m,
+                n_idx * self.block_n : (n_idx + 1) * self.block_n,
             ],
         )
         Tx.sum(
@@ -50,7 +52,7 @@ class Stage1ReduceTile(TileImpl):
         )
         Tx.copy(
             self.B[
-                m_idx * self.BLOCK_M : (m_idx + 1) * self.BLOCK_M,
+                m_idx * self.block_m : (m_idx + 1) * self.block_m,
                 n_idx,
             ],
             self.P_smem,
@@ -58,32 +60,28 @@ class Stage1ReduceTile(TileImpl):
 
 
 class Stage2ReduceTile(TileImpl):
+    """Reduce all B n-block results for one m-block into C[m-block, 0]."""
 
-    def __init__(self, B, C, *, BLOCK_M, NUM_BLOCK_N):
+    def __init__(self, B, C, *, block_m, num_block_n):
         super().__init__()
         self.B = B
         self.C = C
-        self.BLOCK_M = BLOCK_M
-        self.NUM_BLOCK_N = NUM_BLOCK_N
+        self.block_m = block_m
+        self.num_block_n = num_block_n
 
         self.B_smem = None
         self.C_smem = None
 
-    def init(self, smem_manager):
-        self.B_smem = smem_manager.alloc(
-            (self.BLOCK_M, self.NUM_BLOCK_N),
-            "float32",
-        )
-        self.C_smem = smem_manager.alloc(
-            (self.BLOCK_M, 1),
-            "float32",
-        )
+    def device_init(self):
+        # The concrete allocation API is selected by the later lowering pass.
+        self.B_smem = T.alloc_buffer((self.block_m, self.num_block_n), "float32", scope="shared")
+        self.C_smem = T.alloc_buffer((self.block_m, 1), "float32", scope="shared")
 
     def run(self, m_idx, n_idx, k_idx):
         Tx.copy(
             self.B_smem,
             self.B[
-                m_idx * self.BLOCK_M : (m_idx + 1) * self.BLOCK_M,
+                m_idx * self.block_m : (m_idx + 1) * self.block_m,
                 :,
             ],
         )
@@ -93,63 +91,51 @@ class Stage2ReduceTile(TileImpl):
         )
         Tx.copy(
             self.C[
-                m_idx * self.BLOCK_M : (m_idx + 1) * self.BLOCK_M,
+                m_idx * self.block_m : (m_idx + 1) * self.block_m,
                 0,
             ],
             self.C_smem,
         )
 
 
-kernel = KernelSpec("two_stage_reduce")
-
-
 # ============================================================
-# Tensors
+# Upper DSL layer: megakernel spec
 # ============================================================
 
-A = kernel.tensor(
+
+kernel = KernelSpec(
+    "two_stage_reduce",
+    attrs={
+        "source": "B = reduce_each_n_block(A); C = reduce_all_n_blocks(B)",
+    },
+)
+
+A = kernel.input(
     "A",
     shape=(M, N),
     dtype="float32",
 )
 
-B = kernel.tensor(
+B = kernel.intermediate(
     "B",
     shape=(M, NUM_BLOCK_N),
     dtype="float32",
 )
 
-C = kernel.tensor(
+C = kernel.output(
     "C",
     shape=(M, 1),
     dtype="float32",
 )
 
-
-# ============================================================
-# Event
-# ============================================================
-
 row_ready = kernel.event(
     "row_ready",
     shape=(NUM_BLOCK_M,),
-    init=NUM_BLOCK_N,
+    init_count=NUM_BLOCK_N,
+    attrs={
+        "meaning": "all n-block reductions for one m-block have written B",
+    },
 )
-
-
-# ============================================================
-# Tile 1: Stage1 partial row reduction
-# ============================================================
-#
-# tile instance:
-#   stage1(m_idx, n_idx, 0)
-#
-# computes:
-#   A[m-block, n-block] -> B[m-block, n_idx]
-#
-# notifies:
-#   row_ready[m_idx]
-#
 
 stage1 = (
     kernel.tile(
@@ -157,37 +143,18 @@ stage1 = (
         impl=Stage1ReduceTile(
             A,
             B,
-            BLOCK_M=BLOCK_M,
-            BLOCK_N=BLOCK_N,
+            block_m=BLOCK_M,
+            block_n=BLOCK_N,
         ),
         tile_num=(NUM_BLOCK_M, NUM_BLOCK_N, 1),
+        attrs={
+            "source_stage": "B = reduce_each_n_block(A)",
+        },
     )
-    .read(
-        A,
-    )
-    .write(
-        B,
-    )
-    .notify(
-        row_ready,
-        coord_map=lambda m, n, k: (m,),
-    )
+    .read(A)
+    .write(B)
+    .notify(row_ready, coord_map=lambda m, n, k: (m,))
 )
-
-
-# ============================================================
-# Tile 2: Stage2 final row reduction
-# ============================================================
-#
-# tile instance:
-#   stage2(m_idx, 0, 0)
-#
-# waits:
-#   row_ready[m_idx] has received NUM_BLOCK_N notifications
-#
-# computes:
-#   B[m-block, :] -> C[m-block, 0]
-#
 
 stage2 = (
     kernel.tile(
@@ -195,24 +162,15 @@ stage2 = (
         impl=Stage2ReduceTile(
             B,
             C,
-            BLOCK_M=BLOCK_M,
-            NUM_BLOCK_N=NUM_BLOCK_N,
+            block_m=BLOCK_M,
+            num_block_n=NUM_BLOCK_N,
         ),
         tile_num=(NUM_BLOCK_M, 1, 1),
+        attrs={
+            "source_stage": "C = reduce_all_n_blocks(B)",
+        },
     )
-    .read(
-        B,
-    )
-    .write(
-        C,
-    )
-    .wait(
-        row_ready,
-        coord_map=lambda m, n, k: (m,),
-        expected=NUM_BLOCK_N,
-    )
+    .read(B)
+    .write(C)
+    .wait(row_ready, coord_map=lambda m, n, k: (m,))
 )
-
-
-kernel.validate()
-kernel.lower()
