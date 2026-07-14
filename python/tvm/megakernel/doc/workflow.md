@@ -166,12 +166,12 @@ computation for one tile instance.
 `TileImpl` may define:
 
 ```text
-1. init_shared_resources: resources shared by all instances of this tile class
-2. finalize_shared_resources: release shared class-level resources
-3. device_init: device-side state owned by one tile instance
+1. init_shared_resources: parser-style initialization of resources shared by all instances of this tile class
+2. finalize_shared_resources: parser-style finalization of resources shared by all instances of this tile class
+3. device_init: parser-style device initialization for one tile instance
 4. host_init: host-side state owned by one tile instance
-5. prefetch: optional prefetch before the main tile body
-6. run: required tile body for one (m, n, k) tile instance
+5. prefetch: optional parser-style prefetch before the main tile body
+6. run: required parser-style tile body for one (m, n, k) tile instance
 ```
 
 `TileImpl` should not encode global dependency policy.  Dependencies are already

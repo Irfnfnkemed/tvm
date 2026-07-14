@@ -14,32 +14,22 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-"""Megakernel DSL building blocks."""
+"""Megakernel DSL lowering transforms."""
 
-from .impl import SmemAllocRecord, SmemManager, TileImpl
-from .spec import (
-    CoordMapType,
-    EventSpec,
-    ExprLike,
-    KernelSpec,
-    ShapeType,
-    TensorSpec,
-    TileNumType,
-    TileSpec,
-    VarSpec,
+from .lower import (
+    LowerMegakernelDSL,
+    LoweringOptions,
+    MegakernelLowerer,
+    lower_static_queue_init_to_tirx,
+    lower_to_tirx,
+    lower_to_tirx_module,
 )
 
 __all__ = [
-    "CoordMapType",
-    "EventSpec",
-    "ExprLike",
-    "KernelSpec",
-    "ShapeType",
-    "TensorSpec",
-    "SmemAllocRecord",
-    "SmemManager",
-    "TileImpl",
-    "TileNumType",
-    "TileSpec",
-    "VarSpec",
+    "LowerMegakernelDSL",
+    "LoweringOptions",
+    "MegakernelLowerer",
+    "lower_static_queue_init_to_tirx",
+    "lower_to_tirx",
+    "lower_to_tirx_module",
 ]

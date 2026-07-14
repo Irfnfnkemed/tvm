@@ -6,9 +6,9 @@ This document lists the user-facing API in `tvm.megakernel.dsl`.
 
 The DSL has two layers:
 
-- Spec layer: `KernelSpec`, `TensorSpec`, `EventSpec`, `DependencySpec`, and
-  `TileSpec`.  This layer describes tile stages, tensor inputs/outputs, logical
-  events, and wait/notify dependencies.
+- Spec layer: `KernelSpec`, `TensorSpec`, `EventSpec`, and `TileSpec`.  This
+  layer describes tile stages, tensor inputs/outputs, logical events, and
+  wait/notify dependencies.
 - Impl layer: `TileImpl`.  This layer connects a logical tile to the concrete
   implementation of that tile.
 
@@ -21,19 +21,44 @@ layer corresponds to Step 4.
 kernel = KernelSpec(name: str, attrs: dict[str, Any] | None = None)
 ```
 
-Creates one megakernel spec.  Tensors, events, and tiles are registered on this
-object.
+Creates one megakernel spec.  Symbolic variables, tensors, events, and tiles
+are registered on this object.
 
 Parameters:
 
 - `name`: unique name for the megakernel spec.
 - `attrs`: optional metadata reserved for later passes.
 
-
 Example:
 
 ```python
 kernel = KernelSpec("two_stage_reduce", attrs={"target": "sm90"})
+```
+
+## `KernelSpec.var`
+
+```python
+var = kernel.var(name: str, dtype: str = "int32")
+```
+
+Registers a symbolic integer variable that can be used in tensor shapes, event
+shapes, and tile counts.  The current TIRX lowering emits each symbolic
+variable as a local symbolic variable in the PrimFunc body using the `VarSpec`
+dtype, for example `M = T.int32()`, instead of exposing it as a kernel
+parameter.
+
+Parameters:
+
+- `name`: symbolic variable name, unique inside the kernel.
+- `dtype`: scalar dtype used by lowering.  Defaults to `"int32"`.
+
+Returns: `VarSpec`.
+
+Example:
+
+```python
+M = kernel.var("M", dtype="int32")
+A = kernel.tensor("A", shape=(M, 1024), dtype="float32")
 ```
 
 ## `KernelSpec.tensor`
@@ -55,51 +80,8 @@ Returns: `TensorSpec`.
 Example:
 
 ```python
-bs = VarSpec("bs")
+bs = kernel.var("bs")
 A = kernel.tensor("A", shape=(bs, 1024), dtype="float32")
-```
-
-## `KernelSpec.input`
-
-```python
-tensor = kernel.input(name: str, shape: ShapeType, dtype: str)
-```
-
-Registers an input tensor.  This is currently an alias of `tensor()`, provided
-for readability at call sites.
-
-Example:
-
-```python
-A = kernel.input("A", shape=(1024, 1024), dtype="float32")
-```
-
-## `KernelSpec.intermediate`
-
-```python
-tensor = kernel.intermediate(name: str, shape: ShapeType, dtype: str)
-```
-
-Registers an intermediate tensor.  This is currently an alias of `tensor()`.
-
-Example:
-
-```python
-B = kernel.intermediate("B", shape=(1024, 16), dtype="float32")
-```
-
-## `KernelSpec.output`
-
-```python
-tensor = kernel.output(name: str, shape: ShapeType, dtype: str)
-```
-
-Registers an output tensor.  This is currently an alias of `tensor()`.
-
-Example:
-
-```python
-C = kernel.output("C", shape=(1024, 1), dtype="float32")
 ```
 
 ## `KernelSpec.event`
@@ -119,7 +101,7 @@ Registers a logical event tensor.
 Parameters:
 
 - `name`: event name, unique inside the kernel.
-- `shape`: event tensor shape.
+- `shape`: event tensor shape.  Each dimension can be an `int` or `VarSpec`.
 - `init_count`: logical count for each event coordinate.  This can be a single
   integer for a uniform count, or a callable that returns the count for a given
   event coordinate.
@@ -151,6 +133,8 @@ tile = kernel.tile(
     name: str,
     impl: TileImpl,
     tile_num: TileNumType,
+    reads: list[TensorSpec] | None = None,
+    writes: list[TensorSpec] | None = None,
     attrs: dict[str, Any] | None = None,
 )
 ```
@@ -162,6 +146,8 @@ Parameters:
 - `name`: tile stage name, unique inside the kernel.
 - `impl`: local tile implementation object.
 - `tile_num`: tile count on `(m, n, k)` axes.  Use `1` for unused axes.
+- `reads`: tensors read by this tile.
+- `writes`: tensors written by this tile.
 - `attrs`: optional metadata reserved for later passes.
 
 Returns: `TileSpec`.
@@ -169,41 +155,14 @@ Returns: `TileSpec`.
 Example:
 
 ```python
-bs = VarSpec("bs")
+bs = kernel.var("bs")
 tile_a = kernel.tile(
     "tile_a",
     tile_a_impl,
     tile_num=(bs, 16, 1),
+    reads=[A],
+    writes=[B],
 )
-```
-
-## `TileSpec.read`
-
-```python
-tile.read(*tensors: TensorSpec)
-```
-
-Declares tensors read by this tile.  Returns the same `TileSpec`, so calls can
-be chained.
-
-Example:
-
-```python
-tile_a.read(A)
-```
-
-## `TileSpec.write`
-
-```python
-tile.write(*tensors: TensorSpec)
-```
-
-Declares tensors written by this tile.  Returns the same `TileSpec`.
-
-Example:
-
-```python
-tile_a.write(B)
 ```
 
 ## `TileSpec.wait`
@@ -260,6 +219,130 @@ tile_a.notify(
 )
 ```
 
+## `SmemManager`
+
+If a tile implementation uses shared memory, it should access shared memory
+through `SmemManager`.  The manager is the user-facing boundary between tile
+implementation code and the later megakernel lowering pass.
+
+At the DSL level, `SmemManager` has two responsibilities:
+
+- Allocate logical shared-memory buffers and record their metadata.
+- Emit abstract shared-memory phase markers.
+
+It does not expose physical pages, chunks, or concrete mbarrier operations to
+users.  Those are lowering details handled after the DSL and tile
+implementation are combined.
+
+### `SmemManager.__init__`
+
+```python
+smem_manager = SmemManager(smem_max_bytes, chunk_size)
+```
+
+Creates a manager for one shared-memory pool.
+
+Parameters:
+
+- `smem_max_bytes`: total shared-memory bytes reserved for this manager.
+- `chunk_size`: chunk granularity used by the later lowering implementation.
+
+Users should treat `chunk_size` as a manager configuration, not as a physical
+page API.  Tile code should still synchronize through phase markers rather than
+addressing chunks directly.
+
+### `SmemManager.alloc`
+
+```python
+buf = smem_manager.alloc(
+    shape,
+    dtype="float32",
+    strides=None,
+    scope="shared.dyn",
+    align=0,
+    buffer_type="",
+    axis_separators=None,
+    layout="default",
+    policy="shared",
+)
+```
+
+Allocates one logical shared-memory buffer from the managed pool.  The returned
+buffer can be used directly by parser-style TIRX code in `TileImpl.run()`.  The
+manager also records the allocation so the lowering pass can decide the final
+physical shared-memory layout.
+
+`policy` describes the intended lifetime and reuse behavior:
+
+- `"shared"`: default.  The buffer participates in coarse shared-memory phases
+  marked by `acquire_all()` and `release_all()`.
+- `"persistent"`: the buffer is live for the whole megakernel and is not
+  intended to participate in phase-based reuse.  This is useful for long-lived
+  runtime state such as barriers or counters.
+- `"exclusive"`: the buffer asks lowering to avoid physical overlap with other
+  concurrently live buffers.  This is reserved for expert implementations; the
+  first DSL version does not infer fine-grained synchronization correctness.
+
+### `SmemManager.commit`
+
+```python
+smem_manager.commit()
+```
+
+Finalizes the underlying shared-memory pool size annotation after all managed
+allocations have been declared.  In normal DSL usage this should be called by
+the lowering flow, not manually inside the tile computation body.
+
+### `SmemManager.acquire_all`
+
+```python
+smem_manager.acquire_all()
+```
+
+Emits a marker for the beginning of a coarse shared-memory phase.  Managed
+shared-memory buffers used after this marker and before the matching
+`release_all()` are treated as live in the same phase.
+
+This method only emits an abstract marker:
+
+```python
+T.call_extern("void", "tirx.megakernel.smem.wait_all")
+```
+
+The lowering pass is responsible for replacing that marker with the final
+synchronization implementation.
+
+### `SmemManager.release_all`
+
+```python
+smem_manager.release_all()
+```
+
+Emits a marker for the end of the current coarse shared-memory phase:
+
+```python
+T.call_extern("void", "tirx.megakernel.smem.release_all")
+```
+
+The method does not emit concrete synchronization by itself.  The lowering pass
+uses this marker together with the allocation records to generate or optimize
+the final mbarrier/page logic.
+
+### `SmemManager.advance`
+
+```python
+smem_manager.advance()
+```
+
+Emits a marker for advancing the logical shared-memory phase:
+
+```python
+T.call_extern("void", "tirx.megakernel.smem.advance")
+```
+
+This keeps phase movement explicit in the tile implementation while leaving the
+physical phase representation to lowering.
+
 ## `TileImpl`
 
 Users subclass `TileImpl` to define the local implementation for one tile kind.
@@ -267,6 +350,15 @@ Only `run()` is required.
 
 ```python
 class MyTile(TileImpl):
+    def _declare_resources(self, smem_manager):
+        self.smem = smem_manager.alloc(...)
+
+    @T.inline
+    def device_init(self, smem_manager, m_idx, n_idx, k_idx):
+        self._declare_resources(smem_manager)
+        ...
+
+    @T.inline
     def run(self, m_idx, n_idx, k_idx):
         ...
 ```
@@ -275,18 +367,26 @@ class MyTile(TileImpl):
 
 ```python
 @classmethod
-def init_shared_resources(cls): ...
+@T.inline
+def init_shared_resources(cls, smem_manager): ...
 ```
 
-Optional.  Initializes resources shared by all instances of this tile class.
-For example, this hook can allocate shared memory, mbarriers, or tensor memory
-used by all tile instances of the same class.
+Optional.  Emits parser-style initialization for resources shared by all
+instances of this tile class.  Class-level resource declaration or
+handle-recording logic can live in ordinary Python helpers called from this
+hook.
 
 Example:
 
 ```python
 @classmethod
-def init_shared_resources(cls):
+def _declare_class_resources(cls, smem_manager):
+    cls.accum = smem_manager.alloc(...)
+
+@classmethod
+@T.inline
+def init_shared_resources(cls, smem_manager):
+    cls._declare_class_resources(smem_manager)
     warp_id = T.warp_id([...])
     if warp_id == 0:
         T.ptx.tcgen05.alloc(...)
@@ -296,18 +396,19 @@ def init_shared_resources(cls):
 
 ```python
 @classmethod
-def finalize_shared_resources(cls): ...
+@T.inline
+def finalize_shared_resources(cls, smem_manager): ...
 ```
 
-Optional.  Releases resources created by `init_shared_resources()`.  For
-example, this hook can release tensor memory shared by all tile instances of
-the same class.
+Optional.  Emits parser-style finalization for resources initialized by
+`init_shared_resources()`.
 
 Example:
 
 ```python
 @classmethod
-def finalize_shared_resources(cls):
+@T.inline
+def finalize_shared_resources(cls, smem_manager):
     warp_id = T.warp_id([...])
     T.tvm_storage_sync("shared")
     if warp_id == 0:
@@ -315,15 +416,18 @@ def finalize_shared_resources(cls):
         T.ptx.tcgen05.dealloc(...)
 ```
 
-
 ### `TileImpl.device_init`
 
 ```python
-def device_init(self): ...
+@T.inline
+def device_init(self, smem_manager, m_idx, n_idx, k_idx): ...
 ```
 
-Optional.  Initializes device-side state owned by one tile instance.  For
-example, this hook can allocate buffers used by that tile instance.
+Optional.  Emits parser-style device initialization for one tile instance.
+Use this hook for TIRX statements that must appear in the final kernel body.
+Resource declaration or handle-recording logic can live in ordinary Python
+helpers called from this hook; those helpers do not need to be part of the
+public `TileImpl` API.
 
 ### `TileImpl.host_init`
 
@@ -344,6 +448,7 @@ def host_init(self):
 ### `TileImpl.prefetch`
 
 ```python
+@T.inline
 def prefetch(self, m_idx, n_idx, k_idx): ...
 ```
 
@@ -355,6 +460,7 @@ on activations while previous tasks are still incomplete.
 ### `TileImpl.run`
 
 ```python
+@T.inline
 def run(self, m_idx, n_idx, k_idx): ...
 ```
 
@@ -364,17 +470,19 @@ Required.  Defines the computation for one logical tile instance at index
 ## DSL Example
 
 ```python
-stage1 = (
-    kernel.tile("stage1", Stage1Tile(), (NUM_BLOCK_M, NUM_BLOCK_N, 1))
-    .read(A)
-    .write(B)
-    .notify(row_ready, lambda m, n, k: (m,))
-)
+stage1 = kernel.tile(
+    "stage1",
+    Stage1Tile(),
+    tile_num=(NUM_BLOCK_M, NUM_BLOCK_N, 1),
+    reads=[A],
+    writes=[B],
+).notify(row_ready, lambda m, n, k: (m,))
 
-stage2 = (
-    kernel.tile("stage2", Stage2Tile(), (NUM_BLOCK_M, 1, 1))
-    .read(B)
-    .write(C)
-    .wait(row_ready, lambda m, n, k: (m,))
-)
+stage2 = kernel.tile(
+    "stage2",
+    Stage2Tile(),
+    tile_num=(NUM_BLOCK_M, 1, 1),
+    reads=[B],
+    writes=[C],
+).wait(row_ready, lambda m, n, k: (m,))
 ```

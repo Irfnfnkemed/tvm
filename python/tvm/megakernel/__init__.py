@@ -15,3 +15,21 @@
 # specific language governing permissions and limitations
 # under the License.
 """Megakernel DSL prototypes."""
+
+from .transform import (
+    LowerMegakernelDSL,
+    LoweringOptions,
+    MegakernelLowerer,
+    lower_static_queue_init_to_tirx,
+    lower_to_tirx,
+    lower_to_tirx_module,
+)
+
+__all__ = [
+    "LowerMegakernelDSL",
+    "LoweringOptions",
+    "MegakernelLowerer",
+    "lower_static_queue_init_to_tirx",
+    "lower_to_tirx",
+    "lower_to_tirx_module",
+]

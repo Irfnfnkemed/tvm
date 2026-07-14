@@ -26,12 +26,15 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from .impl import TileImpl
+
 
 @dataclass(frozen=True)
 class VarSpec:
     """Symbolic variable used in shapes, tile counts, and event counts."""
 
     name: str
+    dtype: str = "int32"
 
 
 ExprLike = int | VarSpec
@@ -40,7 +43,7 @@ CoordMapType = Callable[[int, int, int], tuple[int, ...]] | tuple[int, ...] | li
 TileNumType = tuple[ExprLike, ExprLike, ExprLike] | list[ExprLike]
 
 # ============================================================
-# Tensor / Event / Dependency
+# Tensor / Event
 # ============================================================
 
 
@@ -75,24 +78,12 @@ class EventSpec:
     attrs: dict[str, Any] = field(default_factory=dict)
 
 
-@dataclass(frozen=True)
-class DependencySpec:
-    """Wait or notify endpoint attached to a tile.
-
-    `coord_map` maps a tile index `(m, n, k)` to an event coordinate.  It can
-    be a callable for index-dependent mappings, or a tuple/list for a static
-    event coordinate.
-    """
-
-    event: EventSpec
-    coord_map: CoordMapType
-    attrs: dict[str, Any] = field(default_factory=dict)
-
 
 # ============================================================
 # TileSpec
 # ============================================================
 
+DependencyType = tuple[EventSpec, CoordMapType]
 
 @dataclass
 class TileSpec:
@@ -107,32 +98,20 @@ class TileSpec:
     tile_num: TileNumType
     reads: list[TensorSpec] = field(default_factory=list)
     writes: list[TensorSpec] = field(default_factory=list)
-    waits: list[DependencySpec] = field(default_factory=list)
-    notifies: list[DependencySpec] = field(default_factory=list)
+    waits: list[DependencyType] = field(default_factory=list)
+    notifies: list[DependencyType] = field(default_factory=list)
     attrs: dict[str, Any] = field(default_factory=dict)
-
-    def read(self, *tensors: TensorSpec):
-        """Declare tensors read by this tile."""
-
-        self.reads.extend(tensors)
-        return self
-
-    def write(self, *tensors: TensorSpec):
-        """Declare tensors written by this tile."""
-
-        self.writes.extend(tensors)
-        return self
 
     def wait(self, event: EventSpec, coord_map: CoordMapType):
         """Declare that this tile waits on `event` at `coord_map`."""
 
-        self.waits.append(DependencySpec(event=event, coord_map=coord_map))
+        self.waits.append((event, coord_map))
         return self
 
     def notify(self, event: EventSpec, coord_map: CoordMapType):
         """Declare that this tile notifies `event` at `coord_map`."""
 
-        self.notifies.append(DependencySpec(event=event, coord_map=coord_map))
+        self.notifies.append((event, coord_map))
         return self
 
 
@@ -147,9 +126,19 @@ class KernelSpec:
     def __init__(self, name: str, attrs: dict[str, Any] | None = None):
         self.name = name
         self.attrs = attrs or {}
+        self.vars: dict[str, VarSpec] = {}
         self.tensors: dict[str, TensorSpec] = {}
         self.events: dict[str, EventSpec] = {}
         self.tiles: list[TileSpec] = []
+
+    def var(self, name: str, dtype: str = "int32"):
+        """Register a symbolic integer variable."""
+
+        if name in self.vars:
+            raise ValueError(f"Duplicate var: {name}")
+        var = VarSpec(name=name, dtype=dtype)
+        self.vars[name] = var
+        return var
 
     def tensor(self, name: str, shape: ShapeType, dtype: str):
         """Register a logical tensor."""
@@ -159,25 +148,6 @@ class KernelSpec:
         tensor = TensorSpec(name=name, shape=shape, dtype=dtype)
         self.tensors[name] = tensor
         return tensor
-
-    def input(self, name: str, shape: ShapeType, dtype: str):
-        """Register an input tensor.
-
-        This is currently an alias of `tensor`; it exists to make call sites
-        clearer without adding extra metadata.
-        """
-
-        return self.tensor(name, shape=shape, dtype=dtype)
-
-    def intermediate(self, name: str, shape: ShapeType, dtype: str):
-        """Register an intermediate tensor."""
-
-        return self.tensor(name, shape=shape, dtype=dtype)
-
-    def output(self, name: str, shape: ShapeType, dtype: str):
-        """Register an output tensor."""
-
-        return self.tensor(name, shape=shape, dtype=dtype)
 
     def event(
         self,
@@ -208,6 +178,8 @@ class KernelSpec:
         name: str,
         impl: TileImpl,
         tile_num: TileNumType,
+        reads: list[TensorSpec] | None = None,
+        writes: list[TensorSpec] | None = None,
         attrs: dict[str, Any] | None = None,
     ):
         """Register one tile stage."""
@@ -218,6 +190,8 @@ class KernelSpec:
             name=name,
             impl=impl,
             tile_num=tile_num,
+            reads=reads or [],
+            writes=writes or [],
             attrs=attrs or {},
         )
         self.tiles.append(tile)
@@ -226,5 +200,7 @@ class KernelSpec:
     def validate(self):
         raise NotImplementedError("Validation is not yet implemented.")
 
-    def lower(self):
-        raise NotImplementedError("Lowering is not yet implemented.")
+    def lower(self, options=None):
+        from tvm.megakernel.transform import lower_to_tirx
+
+        return lower_to_tirx(self, options)
