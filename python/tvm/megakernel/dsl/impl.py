@@ -67,13 +67,13 @@ class SmemManager:
 
         ...
 
-    def acquire_all(self):
-        """Wait until managed shared memory is ready to use."""
+    def wait_all(self, level="cta"):
+        """Wait until all managed shared-memory chunks are ready at CTA scope."""
 
         ...
 
-    def release_all(self):
-        """Release managed shared memory after use."""
+    def release_all(self, level="cta"):
+        """Release all managed shared-memory chunks at CTA scope."""
 
         ...
 

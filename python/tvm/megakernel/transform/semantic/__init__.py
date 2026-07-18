@@ -14,24 +14,16 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-"""Megakernel DSL prototypes."""
+"""Semantic megakernel transform layer."""
 
-from .transform import (
-    LowerMegakernelDSL,
-    LoweringOptions,
-    MegakernelLowerer,
-    NormalizedMegakernelPlan,
-    lower_static_queue_init_to_tirx,
-    lower_to_tirx,
-    lower_to_tirx_module,
-)
+from .build import build_semantic_plan, logical_edges
+from .model import LogicalEdge, SemanticPlan
+from .validate import validate_semantic_plan
 
 __all__ = [
-    "LowerMegakernelDSL",
-    "LoweringOptions",
-    "MegakernelLowerer",
-    "NormalizedMegakernelPlan",
-    "lower_static_queue_init_to_tirx",
-    "lower_to_tirx",
-    "lower_to_tirx_module",
+    "LogicalEdge",
+    "SemanticPlan",
+    "build_semantic_plan",
+    "logical_edges",
+    "validate_semantic_plan",
 ]

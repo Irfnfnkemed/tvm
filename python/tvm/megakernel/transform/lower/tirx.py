@@ -27,9 +27,6 @@ current TIRX builder scope.
 
 from __future__ import annotations
 
-import keyword
-import re
-from dataclasses import dataclass, field
 from typing import Any
 
 import tvm
@@ -37,7 +34,26 @@ from tvm.ir.module import IRModule
 import tvm.tirx.script as T
 from tvm.tirx import PrimFunc
 
-from ..dsl import KernelSpec, TensorSpec, TileSpec, VarSpec
+from ...dsl import KernelSpec, TensorSpec, VarSpec
+from ..semantic import build_semantic_plan, validate_semantic_plan
+from .prepare import (
+    INIT_EVENT_JOB_ID,
+    WAIT_EVENT_INIT_JOB_ID,
+    KernelLoweringPlan,
+    LoweringOptions,
+    NormalizedMegakernelPlan,
+    TaskPhase,
+    TileLoweringInfo,
+    TilePlan,
+)
+from .prepare import (
+    plan_event_workspace_size,
+    prepare_static_lowering_plan,
+    replace_tensor_specs,
+    shape_product as _shape_product,
+    shape_tuple as _shape_tuple,
+)
+from .validate import validate_static_lowering_plan
 from .event import (
     EVENT_NOTIFY_MARKER,
     EVENT_WAIT_MARKER,
@@ -45,68 +61,12 @@ from .event import (
     WAIT_EVENT_INIT_JOB_ID,
     EventBinding,
     EventLoweringMixin,
-    emit_events,
-    event_workspace_size,
+    coord_from_map,
+    emit_marker,
 )
-from .scheduler import StaticTileScheduler
+from .scheduler import StaticTileScheduler, TIRXSemaphore
 from .smem import TIRXSmemManager
 
-
-@dataclass(frozen=True)
-class LoweringOptions:
-    """Configuration for DSL-to-TIRX lowering."""
-
-    smem_max_bytes: int = 228 * 1024
-    smem_chunk_size: int = 16 * 1024
-    schedule: str = "static"
-    emit_event_markers: bool = True
-    emit_smem_markers: bool = True
-    attrs: dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
-class VarBinding:
-    """Final kernel binding for one symbolic variable."""
-
-    var: VarSpec
-    param_name: str
-    value: Any | None = None
-
-
-@dataclass
-class TensorBinding:
-    """Final kernel binding for one logical tensor."""
-
-    tensor: TensorSpec
-    param_name: str
-    buffer: Any | None = None
-
-
-@dataclass
-class TileLoweringInfo:
-    """Lowering-time view of one logical tile."""
-
-    tile: TileSpec
-    job_id: int
-    class_key: Any
-    tensor_bindings: dict[TensorSpec, TensorBinding] = field(default_factory=dict)
-
-
-@dataclass
-class KernelLoweringPlan:
-    """Prepared DSL information used by ``KernelBuilder``."""
-
-    kernel: KernelSpec
-    options: LoweringOptions
-    var_order: list[VarSpec] = field(default_factory=list)
-    var_bindings: dict[VarSpec, VarBinding] = field(default_factory=dict)
-    tensor_order: list[TensorSpec] = field(default_factory=list)
-    tensor_bindings: dict[TensorSpec, TensorBinding] = field(default_factory=dict)
-    tiles: list[TileLoweringInfo] = field(default_factory=list)
-    tile_job_ids: dict[str, int] = field(default_factory=dict)
-    smem_manager: TIRXSmemManager | None = None
-    event_bindings: dict[str, "EventBinding"] = field(default_factory=dict)
-    event_init_complete: EventBinding | None = None
 
 
 class _ParserKernelEmitter:
@@ -149,6 +109,7 @@ class KernelBuilder(EventLoweringMixin):
 
         smem_manager = self.create_smem_manager(plan)
         event_bindings = self.bind_event_buffers(plan, event_workspace)
+        smem_manager.init()
 
         for tile_info in self.unique_tile_classes(plan):
             type(tile_info.tile.impl).init_shared_resources(smem_manager)
@@ -177,11 +138,41 @@ class KernelBuilder(EventLoweringMixin):
         return buffers
 
     def emit_event_workspace_arg(self, plan: KernelLoweringPlan):
-        events = list(plan.kernel.events.values())
-        if not events:
+        if not plan.event_layouts:
             return None
-        size = event_workspace_size(events, plan)
-        return T.arg("event_workspace", T.Buffer((size,), "int32"))
+        return T.arg("event_workspace", T.Buffer((plan_event_workspace_size(plan),), "int32"))
+
+    def bind_event_buffers(self, plan, event_workspace) -> dict[str, EventBinding]:
+        if not plan.event_layouts:
+            return {}
+        if event_workspace is None:
+            raise ValueError("event lowering requires an event workspace argument")
+
+        for event_plan in plan.event_layouts:
+            shape = _shape_tuple(
+                event_plan.shape, f"event {event_plan.name} shape", plan
+            )
+            buffer = T.decl_buffer(
+                shape,
+                event_plan.dtype,
+                data=event_workspace.data,
+                elem_offset=event_plan.workspace_offset,
+                scope="global",
+            )
+            size = _shape_product(shape)
+            plan.event_bindings[event_plan.name] = EventBinding(
+                event=event_plan.event,
+                buffer=buffer,
+                size=size,
+            )
+
+        if plan.event_init_complete_layout is not None:
+            plan.event_init_complete = EventBinding(
+                event=None,
+                buffer=event_workspace,
+                size=1,
+            )
+        return plan.event_bindings
 
     def emit_static_queue_arg(self, plan: KernelLoweringPlan):
         if plan.options.schedule != "static":
@@ -232,7 +223,7 @@ class KernelBuilder(EventLoweringMixin):
         )
         scheduler.init()
 
-        tile_dispatch = {tile_info.job_id: tile_info for tile_info in plan.tiles}
+        tile_dispatch = {tile_plan.job_id: tile_plan for tile_plan in plan.tile_plans}
         with T.While(scheduler.valid()):
             idxs, job_id = scheduler.get_idx_and_task_type()
             self.emit_job_dispatch(
@@ -285,7 +276,7 @@ class KernelBuilder(EventLoweringMixin):
 
     def emit_tile(
         self,
-        tile_info: TileLoweringInfo,
+        tile_plan: TilePlan,
         scheduler: StaticTileScheduler,
         smem_manager: TIRXSmemManager,
         event_bindings: dict[str, EventBinding],
@@ -293,13 +284,18 @@ class KernelBuilder(EventLoweringMixin):
         n_idx,
         k_idx,
     ) -> None:
-        tile = tile_info.tile
+        tile = tile_plan.tile
         smem_manager.set_tile(tile)
         tile.impl.device_init(smem_manager, m_idx, n_idx, k_idx)
-        emit_events(tile.waits, EVENT_WAIT_MARKER, scheduler, event_bindings, m_idx, n_idx, k_idx, self.options)
         tile.impl.prefetch(m_idx, n_idx, k_idx)
+        emit_wait_plans(
+            tile_plan.waits, scheduler, event_bindings, m_idx, n_idx, k_idx, self.options
+        )
         tile.impl.run(m_idx, n_idx, k_idx)
-        emit_events(tile.notifies, EVENT_NOTIFY_MARKER, scheduler, event_bindings, m_idx, n_idx, k_idx, self.options)
+        smem_manager.validate_tile_phase(tile)
+        emit_notify_plans(
+            tile_plan.notifies, scheduler, event_bindings, m_idx, n_idx, k_idx, self.options
+        )
 
     def bind_tensor_buffers(self, plan: KernelLoweringPlan, buffers: list[Any]) -> None:
         if len(buffers) != len(plan.tensor_order):
@@ -313,7 +309,7 @@ class KernelBuilder(EventLoweringMixin):
         for tile_info in plan.tiles:
             impl = tile_info.tile.impl
             for attr_name, value in vars(impl).items():
-                new_value = _replace_tensor_specs(value, plan.tensor_bindings)
+                new_value = replace_tensor_specs(value, plan.tensor_bindings)
                 if new_value is not value:
                     patches.append((impl, attr_name, value))
                     setattr(impl, attr_name, new_value)
@@ -328,7 +324,13 @@ class KernelBuilder(EventLoweringMixin):
         delattr(plan, "_tensor_attr_patches")
 
     def create_smem_manager(self, plan: KernelLoweringPlan) -> TIRXSmemManager:
-        smem_manager = TIRXSmemManager(plan.options.smem_max_bytes, plan.options.smem_chunk_size)
+        num_threads = plan.options.attrs.get("num_threads", 256)
+        smem_manager = TIRXSmemManager(
+            plan.options.smem_max_bytes,
+            plan.options.smem_chunk_size,
+            num_threads=num_threads,
+            warp_count=max(1, num_threads // 32),
+        )
         plan.smem_manager = smem_manager
         return smem_manager
 
@@ -372,8 +374,6 @@ class StaticQueueInitBuilder:
         sm_count = attrs.get("sm_count", 1)
         num_threads = attrs.get("num_threads", 256)
         max_tasks = attrs.get("max_tasks", StaticTileScheduler.MAX_TASKS)
-        end_job_id = attrs.get("end_job_id", 31)
-
         _emit_local_symbolic_vars(plan)
         queue_handle = T.arg("queue", T.handle())
         queue = T.match_buffer(queue_handle, (sm_count, max_tasks), "int32")
@@ -384,70 +384,29 @@ class StaticQueueInitBuilder:
         idx = T.alloc_buffer((1,), "int32", scope="local")
         T.buffer_store(idx, 0, [0])
 
-        phases = self._phases(plan, sm_count, end_job_id)
-        for phase_id, phase in enumerate(phases):
+        if plan.static_schedule is None:
+            raise ValueError("static queue init requires a static schedule plan")
+        for phase_id, phase in enumerate(plan.static_schedule.phases):
+            phase_count = self._phase_count(plan, phase)
             with T.If(bx == phase_id):
                 with T.Then():
                     with T.If(tid == 0):
                         with T.Then():
-                            self._emit_phase(queue, idx, phase, sm_count)
+                            self._emit_phase(plan, queue, idx, phase, sm_count)
                 with T.Else():
-                    T.buffer_store(idx, idx[0] + phase["count"], [0])
+                    T.buffer_store(idx, idx[0] + phase_count, [0])
 
-    def _phases(self, plan: KernelLoweringPlan, sm_count: int, end_job_id: int) -> list[dict[str, Any]]:
-        phases: list[dict[str, Any]] = []
-        events = list(plan.kernel.events.values())
-        if events:
-            phases.append(
-                {
-                    "kind": "grid",
-                    "job_id": INIT_EVENT_JOB_ID,
-                    "tile_num": (len(events) + 1, 1, 1),
-                    "count": len(events) + 1,
-                }
-            )
+    def _phase_count(self, plan: KernelLoweringPlan, phase: TaskPhase) -> Any:
+        tile_num = _shape_tuple(phase.tile_num, f"phase {phase.label} tile_num", plan)
+        return _shape_product(tile_num)
 
-        entry_tiles = [tile_info for tile_info in plan.tiles if not tile_info.tile.waits]
-        rest_tiles = [tile_info for tile_info in plan.tiles if tile_info.tile.waits]
-        for tile_info in entry_tiles:
-            phases.append(self._tile_phase(plan, tile_info))
-
-        if events:
-            phases.append(
-                {
-                    "kind": "grid",
-                    "job_id": WAIT_EVENT_INIT_JOB_ID,
-                    "tile_num": (sm_count, 1, 1),
-                    "count": sm_count,
-                }
-            )
-
-        for tile_info in rest_tiles:
-            phases.append(self._tile_phase(plan, tile_info))
-
-        phases.append(
-            {
-                "kind": "grid",
-                "job_id": end_job_id,
-                "tile_num": (sm_count, 1, 1),
-                "count": sm_count,
-            }
-        )
-        return phases
-
-    def _tile_phase(self, plan: KernelLoweringPlan, tile_info: TileLoweringInfo) -> dict[str, Any]:
-        tile_num = _shape_tuple(tile_info.tile.tile_num, f"tile {tile_info.tile.name} tile_num", plan)
-        return {
-            "kind": "grid",
-            "job_id": tile_info.job_id,
-            "tile_num": tile_num,
-            "count": _shape_product(tile_num),
-        }
-
-    def _emit_phase(self, queue, idx, phase: dict[str, Any], sm_count: int) -> None:
-        for_grid = T.grid(*phase["tile_num"])
+    def _emit_phase(
+        self, plan: KernelLoweringPlan, queue, idx, phase: TaskPhase, sm_count: int
+    ) -> None:
+        tile_num = _shape_tuple(phase.tile_num, f"phase {phase.label} tile_num", plan)
+        for_grid = T.grid(*tile_num)
         m_idx, n_idx, k_idx = for_grid.__enter__()
-        packed = _pack_static_task(m_idx, n_idx, k_idx, phase["job_id"])
+        packed = _pack_static_task(m_idx, n_idx, k_idx, phase.job_id)
         T.buffer_store(queue, packed, [idx[0] % sm_count, idx[0] // sm_count])
         T.buffer_store(idx, idx[0] + 1, [0])
         for_grid.__exit__(None, None, None)
@@ -462,36 +421,11 @@ class MegakernelLowerer:
         self.static_queue_init_builder = StaticQueueInitBuilder()
 
     def prepare(self, kernel: KernelSpec) -> KernelLoweringPlan:
-        plan = KernelLoweringPlan(kernel=kernel, options=self.options)
-        self._bind_vars(plan)
-        self._bind_tensors(plan)
-        self._bind_tiles(plan)
+        semantic = build_semantic_plan(kernel)
+        validate_semantic_plan(semantic)
+        plan = prepare_static_lowering_plan(semantic, self.options)
+        validate_static_lowering_plan(plan)
         return plan
-
-    def _bind_vars(self, plan: KernelLoweringPlan) -> None:
-        used_names: set[str] = set()
-        for var in _collect_kernel_vars(plan.kernel):
-            param_name = _sanitize_identifier(var.name, used_names)
-            plan.var_order.append(var)
-            plan.var_bindings[var] = VarBinding(var=var, param_name=param_name)
-
-    def _bind_tensors(self, plan: KernelLoweringPlan) -> None:
-        used_names: set[str] = set()
-        for tensor in plan.kernel.tensors.values():
-            param_name = _sanitize_identifier(tensor.name, used_names)
-            plan.tensor_order.append(tensor)
-            plan.tensor_bindings[tensor] = TensorBinding(tensor=tensor, param_name=param_name)
-
-    def _bind_tiles(self, plan: KernelLoweringPlan) -> None:
-        for job_id, tile in enumerate(plan.kernel.tiles):
-            info = TileLoweringInfo(tile=tile, job_id=job_id, class_key=type(tile.impl))
-            info.tensor_bindings = {
-                tensor: plan.tensor_bindings[tensor]
-                for tensor in [*tile.reads, *tile.writes]
-                if tensor in plan.tensor_bindings
-            }
-            plan.tile_job_ids[tile.name] = job_id
-            plan.tiles.append(info)
 
     def lower(self, kernel: KernelSpec) -> PrimFunc:
         return self.kernel_builder.build(self.prepare(kernel))
@@ -511,45 +445,48 @@ class MegakernelLowerer:
         return self.create_tile_infos(kernel)
 
 
-def _sanitize_identifier(name: str, used_names: set[str]) -> str:
-    candidate = re.sub(r"\W", "_", name)
-    if not candidate or candidate[0].isdigit() or keyword.iskeyword(candidate):
-        candidate = f"tensor_{candidate}"
-    base = candidate
-    suffix = 1
-    while candidate in used_names:
-        candidate = f"{base}_{suffix}"
-        suffix += 1
-    used_names.add(candidate)
-    return candidate
+
+def emit_wait_plans(
+    waits,
+    scheduler: StaticTileScheduler | None,
+    event_bindings: dict[str, EventBinding],
+    m_idx,
+    n_idx,
+    k_idx,
+    options: LoweringOptions,
+) -> None:
+    for event, coord_map in waits:
+        coord = coord_from_map(coord_map, m_idx, n_idx, k_idx)
+        if event.name not in event_bindings:
+            if options.emit_event_markers:
+                emit_marker(EVENT_WAIT_MARKER, event.name, *coord)
+            continue
+        semaphore = TIRXSemaphore(event_bindings[event.name].buffer)
+        scheduler.wait(semaphore, *coord)
 
 
-def _shape_tuple(shape: Any, context: str, plan: KernelLoweringPlan | None = None) -> tuple[Any, ...]:
-    if isinstance(shape, (tuple, list)):
-        return tuple(_lower_expr_like(dim, context, plan) for dim in shape)
-    return (_lower_expr_like(shape, context, plan),)
+def emit_notify_plans(
+    notifies,
+    scheduler: StaticTileScheduler | None,
+    event_bindings: dict[str, EventBinding],
+    m_idx,
+    n_idx,
+    k_idx,
+    options: LoweringOptions,
+) -> None:
+    for event, coord_map in notifies:
+        coord = coord_from_map(coord_map, m_idx, n_idx, k_idx)
+        if event.name not in event_bindings:
+            if options.emit_event_markers:
+                emit_marker(EVENT_NOTIFY_MARKER, event.name, *coord)
+            continue
+        semaphore = TIRXSemaphore(event_bindings[event.name].buffer)
 
+        def notify_func(_notify_idx, coord=coord):
+            return (1, -1, *coord)
 
-def _shape_product(shape: tuple[Any, ...]) -> Any:
-    result = 1
-    for extent in shape:
-        result *= extent
-    return result
+        scheduler.notify(semaphore, notify_func, scope="cta")
 
-
-def _replace_tensor_specs(value: Any, bindings: dict[TensorSpec, TensorBinding]) -> Any:
-    if isinstance(value, TensorSpec) and value in bindings:
-        return bindings[value].buffer
-    if isinstance(value, tuple):
-        return tuple(_replace_tensor_specs(item, bindings) for item in value)
-    if isinstance(value, list):
-        return [_replace_tensor_specs(item, bindings) for item in value]
-    if isinstance(value, dict):
-        return {
-            _replace_tensor_specs(key, bindings): _replace_tensor_specs(val, bindings)
-            for key, val in value.items()
-        }
-    return value
 
 
 def _emit_local_symbolic_vars(plan: KernelLoweringPlan) -> None:
@@ -564,39 +501,6 @@ def _pack_static_task(m_idx, n_idx, k_idx, job_id: int):
         T.bitwise_or(T.shift_left(n_idx, 18), T.shift_left(k_idx, 28)),
     )
 
-
-def _collect_kernel_vars(kernel: KernelSpec) -> list[VarSpec]:
-    seen: set[VarSpec] = set()
-    result: list[VarSpec] = []
-
-    def add_from(value: Any) -> None:
-        if isinstance(value, VarSpec):
-            if value not in seen:
-                seen.add(value)
-                result.append(value)
-        elif isinstance(value, (tuple, list)):
-            for item in value:
-                add_from(item)
-
-    for var in getattr(kernel, "vars", {}).values():
-        add_from(var)
-    for tensor in kernel.tensors.values():
-        add_from(tensor.shape)
-    for event in kernel.events.values():
-        add_from(event.shape)
-    for tile in kernel.tiles:
-        add_from(tile.tile_num)
-    return result
-
-
-def _lower_expr_like(value: Any, context: str, plan: KernelLoweringPlan | None = None) -> Any:
-    if isinstance(value, int):
-        return value
-    if isinstance(value, VarSpec):
-        if plan is None or value not in plan.var_bindings or plan.var_bindings[value].value is None:
-            raise ValueError(f"{context} uses unbound symbolic VarSpec({value.name!r})")
-        return plan.var_bindings[value].value
-    raise TypeError(f"{context} must be an int or VarSpec, got {value!r}")
 
 
 def lower_to_tirx(kernel: KernelSpec, options: LoweringOptions | None = None) -> PrimFunc:

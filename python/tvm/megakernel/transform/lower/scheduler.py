@@ -22,7 +22,7 @@ from typing import Any
 
 import tvm.tirx.script as T
 
-from ..dsl.impl import SmemManager
+from ...dsl.impl import SmemManager
 
 
 def _gt(lhs, rhs):
@@ -151,6 +151,8 @@ class StaticTileScheduler:
     def init(self) -> None:
         self._alloc()
         bx = T.cta_id([self.sm_count])
+        T.warp_id([self.num_threads // 32])
+        T.lane_id([32])
         tid = T.thread_id([self.num_threads])
         self.tile_idx[0] = 0
         for k in T.serial(0, (self.max_tasks + self.num_threads - 1) // self.num_threads):

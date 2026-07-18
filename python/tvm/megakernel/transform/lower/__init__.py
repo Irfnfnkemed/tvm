@@ -14,53 +14,24 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-"""Megakernel DSL lowering transforms."""
+"""TIRX megakernel lowering backend."""
 
-from .lower import (
+from .tirx import (
     LowerMegakernelDSL,
-    LoweringOptions,
     MegakernelLowerer,
-    NormalizedMegakernelPlan,
     lower_static_queue_init_to_tirx,
     lower_to_tirx,
     lower_to_tirx_module,
 )
-from .semantic import LogicalEdge, SemanticPlan, build_semantic_plan, validate_semantic_plan
-from .lower.prepare import (
-    EventLayout,
-    KernelLoweringPlan,
-    StaticLoweringPlan,
-    StaticSchedulePlan,
-    TaskPhase,
-    TensorBinding,
-    TileLoweringInfo,
-    TilePlan,
-    VarBinding,
-)
-from .lower.validate import validate_static_lowering_plan
+from .prepare import LoweringOptions, NormalizedMegakernelPlan, StaticLoweringPlan
 
 __all__ = [
     "LowerMegakernelDSL",
     "LoweringOptions",
     "MegakernelLowerer",
     "NormalizedMegakernelPlan",
+    "StaticLoweringPlan",
     "lower_static_queue_init_to_tirx",
     "lower_to_tirx",
     "lower_to_tirx_module",
-
-    "EventLayout",
-    "KernelLoweringPlan",
-    "LogicalEdge",
-    "StaticLoweringPlan",
-    "SemanticPlan",
-    "StaticSchedulePlan",
-    "TaskPhase",
-    "TensorBinding",
-    "TileLoweringInfo",
-    "TilePlan",
-    "VarBinding",
-    "build_semantic_plan",
-    "prepare_static_lowering_plan",
-    "validate_semantic_plan",
-    "validate_static_lowering_plan",
 ]

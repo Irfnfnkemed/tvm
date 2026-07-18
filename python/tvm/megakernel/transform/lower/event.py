@@ -23,15 +23,13 @@ from typing import Any
 
 import tvm.tirx.script as T
 
-from ..dsl import EventSpec, VarSpec
+from ...dsl import EventSpec, ExprSpec, VarSpec
+from .prepare import EVENT_INIT_COMPLETE_NAME, INIT_EVENT_JOB_ID, WAIT_EVENT_INIT_JOB_ID
 from .scheduler import StaticTileScheduler, TIRXSemaphore
 
 
 EVENT_WAIT_MARKER = "tirx.megakernel.event.wait"
 EVENT_NOTIFY_MARKER = "tirx.megakernel.event.notify"
-INIT_EVENT_JOB_ID = 29
-WAIT_EVENT_INIT_JOB_ID = 30
-EVENT_INIT_COMPLETE_NAME = "__event_init_complete__"
 
 
 @dataclass
@@ -137,23 +135,22 @@ class EventLoweringMixin:
         if event_workspace is None:
             raise ValueError("event lowering requires an event workspace argument")
 
-        offset = 0
-        for event in events:
-            shape = event_shape_tuple(event.shape, f"event {event.name} shape", plan)
+        for event_plan in plan.event_layouts:
+            event = event_plan.event
+            shape = event_shape_tuple(event_plan.shape, f"event {event_plan.name} shape", plan)
             size = shape_product(shape)
             buffer = T.decl_buffer(
                 shape,
-                event.dtype,
+                event_plan.dtype,
                 data=event_workspace.data,
-                elem_offset=offset,
+                elem_offset=event_plan.workspace_offset,
                 scope="global",
             )
-            plan.event_bindings[event.name] = EventBinding(
+            plan.event_bindings[event_plan.name] = EventBinding(
                 event=event,
                 buffer=buffer,
                 size=size,
             )
-            offset += size
 
         plan.event_init_complete = EventBinding(
             event=None,
@@ -208,6 +205,8 @@ def event_init_task_count(events: list[EventSpec], plan) -> Any:
 
 
 def event_init_complete_coord(plan) -> Any:
+    if plan.event_init_complete_layout is not None:
+        return plan.event_init_complete_layout.workspace_offset
     return event_init_task_count(list(plan.kernel.events.values()), plan)
 
 
@@ -218,13 +217,30 @@ def event_shape_tuple(shape: Any, context: str, plan) -> tuple[Any, ...]:
 
 
 def event_lower_expr_like(value: Any, context: str, plan) -> Any:
-    if isinstance(value, int):
+    if isinstance(value, int) and not isinstance(value, bool):
         return value
     if isinstance(value, VarSpec):
         if value not in plan.var_bindings or plan.var_bindings[value].value is None:
             raise ValueError(f"{context} uses unbound symbolic VarSpec({value.name!r})")
         return plan.var_bindings[value].value
-    raise TypeError(f"{context} must be an int or VarSpec, got {value!r}")
+    if isinstance(value, ExprSpec):
+        args = [event_lower_expr_like(arg, context, plan) for arg in value.args]
+        if value.op == "add":
+            return args[0] + args[1]
+        if value.op == "sub":
+            return args[0] - args[1]
+        if value.op == "mul":
+            return args[0] * args[1]
+        if value.op == "floordiv":
+            return args[0] // args[1]
+        if value.op == "mod":
+            return args[0] % args[1]
+        if value.op == "neg":
+            return -args[0]
+        if value.op == "ceildiv":
+            return (args[0] + args[1] - 1) // args[1]
+        raise ValueError(f"{context} uses unsupported ExprSpec op {value.op!r}")
+    raise TypeError(f"{context} must be an int, VarSpec, or ExprSpec, got {value!r}")
 
 
 def shape_product(shape: tuple[Any, ...]) -> Any:

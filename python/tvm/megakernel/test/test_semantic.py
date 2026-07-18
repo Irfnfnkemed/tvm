@@ -1,0 +1,554 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+"""Semantic validation tests for megakernel DSL graphs."""
+
+from __future__ import annotations
+
+import pytest
+
+from tvm.megakernel.dsl import KernelSpec, R, TileImpl
+from tvm.megakernel.transform.semantic import build_semantic_plan, validate_semantic_plan
+
+
+class EmptyTile(TileImpl):
+    def run(self, m_idx, n_idx, k_idx):
+        pass
+
+
+def _validate(kernel):
+    return validate_semantic_plan(build_semantic_plan(kernel))
+
+
+def _r1(tensor):
+    return tensor.region(lambda m, n, k: R[m])
+
+
+def _r2(tensor):
+    return tensor.region(lambda m, n, k: R[m, n])
+
+
+def _r2_first_col(tensor):
+    return tensor.region(lambda m, n, k: R[m, 0])
+
+
+def _basic_kernel(name="semantic"):
+    kernel = KernelSpec(name)
+    tensor = kernel.tensor("x", (4, 3), "float32")
+    ready = kernel.event("ready", (4, 3), init_count=1)
+    producer = kernel.tile("producer", EmptyTile(), (4, 3, 1), reads=[_r2(tensor)])
+    consumer = kernel.tile("consumer", EmptyTile(), (4, 3, 1), reads=[_r2(tensor)])
+    producer.notify(ready, lambda m, n, k: (m, n))
+    consumer.wait(ready, lambda m, n, k: (m, n))
+    return kernel, tensor, ready, producer, consumer
+
+
+def _symbolic_kernel(name="semantic_symbolic"):
+    kernel = KernelSpec(name)
+    rows = kernel.var("rows")
+    groups = kernel.var("groups")
+    tensor = kernel.tensor("x", (rows, groups), "float32")
+    ready = kernel.event("ready", (rows, groups), init_count=1)
+    producer = kernel.tile("producer", EmptyTile(), (rows, groups, 1), reads=[_r2(tensor)])
+    consumer = kernel.tile("consumer", EmptyTile(), (rows, groups, 1), reads=[_r2(tensor)])
+    producer.notify(ready, lambda m, n, k: (m, n))
+    consumer.wait(ready, lambda m, n, k: (m, n))
+    return kernel, ready, producer, consumer
+
+
+def test_semantic_accepts_valid_static_graph():
+    kernel, _, _, _, _ = _basic_kernel()
+
+    plan = _validate(kernel)
+
+    assert [(edge.producer.name, edge.consumer.name, edge.event.name) for edge in plan.logical_edges] == [
+        ("producer", "consumer", "ready")
+    ]
+
+
+def test_semantic_rejects_duplicate_tile_name():
+    kernel, _, _, producer, _ = _basic_kernel()
+    kernel.tiles.append(producer)
+
+    with pytest.raises(ValueError, match="duplicate tile names"):
+        _validate(kernel)
+
+
+def test_semantic_rejects_foreign_tensor():
+    kernel, _, _, producer, _ = _basic_kernel()
+    foreign = KernelSpec("foreign_tensor").tensor("foreign", (1,), "float32")
+    producer.reads.append(foreign.region(lambda m, n, k: R[0]))
+
+    with pytest.raises(ValueError, match="tensor outside kernel"):
+        _validate(kernel)
+
+
+def test_semantic_allows_bare_tensor_access_with_event_dependency():
+    kernel = KernelSpec("semantic_bare_tensor")
+    tensor = kernel.tensor("x", (1,), "float32")
+    ready = kernel.event("ready", (1,), init_count=1)
+
+    kernel.tile("writer", EmptyTile(), (1, 1, 1), writes=[tensor]).notify(
+        ready, lambda m, n, k: (0,)
+    )
+    kernel.tile("reader", EmptyTile(), (1, 1, 1), reads=[tensor]).wait(
+        ready, lambda m, n, k: (0,)
+    )
+
+    _validate(kernel)
+
+
+def test_semantic_rejects_foreign_notify_event():
+    kernel, _, _, producer, _ = _basic_kernel()
+    foreign = KernelSpec("foreign_event").event("foreign", (1,), 1)
+    producer.notifies[0] = (foreign, lambda m, n, k: (0,))
+
+    with pytest.raises(ValueError, match="event outside kernel"):
+        _validate(kernel)
+
+
+def test_semantic_rejects_foreign_wait_event():
+    kernel, _, _, _, consumer = _basic_kernel()
+    foreign = KernelSpec("foreign_event").event("foreign", (1,), 1)
+    consumer.waits[0] = (foreign, lambda m, n, k: (0,))
+
+    with pytest.raises(ValueError, match="event outside kernel"):
+        _validate(kernel)
+
+
+@pytest.mark.parametrize(
+    "coord_map,error,match",
+    [
+        pytest.param(lambda m, n, k: m, TypeError, "tuple/list", id="not-tuple"),
+        pytest.param(lambda m, n, k: (m, n, k), ValueError, "coord rank", id="rank-mismatch"),
+        pytest.param(lambda m, n, k: (m, None), TypeError, "unsupported value", id="bad-value"),
+    ],
+)
+def test_semantic_rejects_invalid_coord_map_shape(coord_map, error, match):
+    kernel, _, ready, producer, _ = _basic_kernel()
+    producer.notifies[0] = (ready, coord_map)
+
+    with pytest.raises(error, match=match):
+        _validate(kernel)
+
+
+def test_semantic_rejects_wait_without_producer():
+    kernel, _, _, producer, _ = _basic_kernel()
+    producer.notifies.clear()
+
+    with pytest.raises(ValueError, match="no producer"):
+        _validate(kernel)
+
+
+def test_semantic_rejects_notify_without_consumer():
+    kernel, _, _, _, consumer = _basic_kernel()
+    consumer.waits.clear()
+
+    with pytest.raises(ValueError, match="no consumer"):
+        _validate(kernel)
+
+
+def test_semantic_rejects_notify_count_mismatch():
+    kernel, _, ready, producer, _ = _basic_kernel()
+    producer.notifies[0] = (ready, lambda m, n, k: (m, 0))
+
+    with pytest.raises(ValueError, match="init_count"):
+        _validate(kernel)
+
+
+def test_semantic_rejects_wait_out_of_bounds():
+    kernel, _, ready, _, consumer = _basic_kernel()
+    consumer.waits[0] = (ready, lambda m, n, k: (m, 3))
+
+    with pytest.raises(ValueError, match="out of bounds"):
+        _validate(kernel)
+
+
+def test_semantic_rejects_wait_without_matching_notify_coord():
+    kernel = KernelSpec("semantic_wait_coord")
+    tensor = kernel.tensor("x", (4, 2), "float32")
+    ready = kernel.event(
+        "ready",
+        (4, 2),
+        init_count=lambda coord: 1 if coord[1] == 0 else 0,
+    )
+
+    kernel.tile("producer", EmptyTile(), (4, 1, 1), reads=[_r2_first_col(tensor)]).notify(
+        ready, lambda m, n, k: (m, 0)
+    )
+    kernel.tile(
+        "consumer",
+        EmptyTile(),
+        (4, 1, 1),
+        reads=[tensor.region(lambda m, n, k: R[m, 1])],
+    ).wait(ready, lambda m, n, k: (m, 1))
+
+    with pytest.raises(ValueError, match="without a producer notify"):
+        _validate(kernel)
+
+
+def test_semantic_accepts_valid_symbolic_graph():
+    kernel, _, _, _ = _symbolic_kernel()
+
+    _validate(kernel)
+
+
+def test_semantic_samples_symbolic_notify_count_mismatch():
+    kernel, ready, producer, _ = _symbolic_kernel()
+    producer.notifies[0] = (ready, lambda m, n, k: (m, 0))
+
+    with pytest.raises(ValueError, match="init_count"):
+        _validate(kernel)
+
+
+def test_semantic_samples_symbolic_wait_swapped_coords():
+    kernel, ready, _, consumer = _symbolic_kernel()
+    consumer.waits[0] = (ready, lambda m, n, k: (n, m))
+
+    with pytest.raises(ValueError, match="out of bounds|without a producer notify"):
+        _validate(kernel)
+
+
+def test_semantic_samples_symbolic_range_bounds():
+    kernel = KernelSpec("semantic_symbolic_range")
+    rows = kernel.var("rows", range=(20, 24))
+    tensor = kernel.tensor("x", (rows,), "float32")
+    ready = kernel.event("ready", (rows,), init_count=1)
+
+    kernel.tile("producer", EmptyTile(), (16, 1, 1), reads=[_r1(tensor)]).notify(
+        ready, lambda m, n, k: (m,)
+    )
+    kernel.tile("consumer", EmptyTile(), (16, 1, 1), reads=[_r1(tensor)]).wait(
+        ready, lambda m, n, k: (m,)
+    )
+
+    with pytest.raises(ValueError, match="init_count"):
+        _validate(kernel)
+
+
+def test_kernel_var_rejects_invalid_range():
+    kernel = KernelSpec("invalid_var_range")
+
+    with pytest.raises(ValueError, match="range"):
+        kernel.var("rows", range=(8, 1))
+
+
+def test_semantic_accepts_varspec_expression_in_shape_event_and_tile_num():
+    kernel = KernelSpec("semantic_expr_shape")
+    rows = kernel.var("rows", range=(1, 9))
+    blocks = rows.ceildiv(4)
+    tensor = kernel.tensor("x", (rows + 1,), "float32")
+    ready = kernel.event("ready", (blocks,), init_count=1)
+
+    kernel.tile("producer", EmptyTile(), (blocks, 1, 1), writes=[tensor]).notify(
+        ready, lambda m, n, k: (m,)
+    )
+    kernel.tile("consumer", EmptyTile(), (blocks, 1, 1), reads=[tensor]).wait(
+        ready, lambda m, n, k: (m,)
+    )
+
+    plan = _validate(kernel)
+
+    assert [var.name for var in plan.vars] == ["rows"]
+
+
+def test_semantic_rejects_foreign_varspec_inside_expression():
+    kernel = KernelSpec("semantic_expr_foreign_var")
+    rows = kernel.var("rows", range=(1, 4))
+    foreign = KernelSpec("foreign").var("foreign", range=(1, 4))
+
+    kernel.tensor("x", (rows + foreign,), "float32")
+
+    with pytest.raises(ValueError, match="VarSpec outside this kernel"):
+        _validate(kernel)
+
+
+def test_semantic_accepts_region_dependency_covered_by_event():
+    kernel = KernelSpec("semantic_region_dep")
+    tensor = kernel.tensor("x", (4,), "float32")
+    ready = kernel.event("ready", (4,), init_count=1)
+
+    kernel.tile(
+        "producer",
+        EmptyTile(),
+        (4, 1, 1),
+        writes=[tensor.region(lambda m, n, k: R[m])],
+    ).notify(ready, lambda m, n, k: (m,))
+    kernel.tile(
+        "consumer",
+        EmptyTile(),
+        (4, 1, 1),
+        reads=[tensor.region(lambda m, n, k: R[m])],
+    ).wait(ready, lambda m, n, k: (m,))
+
+    _validate(kernel)
+
+
+def test_semantic_allows_region_read_from_external_input():
+    kernel = KernelSpec("semantic_region_external_input")
+    tensor = kernel.tensor("x", (4,), "float32")
+
+    kernel.tile(
+        "consumer", EmptyTile(), (4, 1, 1), reads=[tensor.region(lambda m, n, k: R[m])]
+    )
+
+    _validate(kernel)
+
+
+def test_semantic_rejects_waited_coord_that_does_not_write_read_region():
+    kernel = KernelSpec("semantic_waited_coord_wrong_region")
+    tensor = kernel.tensor("x", (2,), "float32")
+    ready = kernel.event("ready", (1,), init_count=1)
+
+    kernel.tile(
+        "producer",
+        EmptyTile(),
+        (1, 1, 1),
+        writes=[tensor.region(lambda m, n, k: R[0])],
+    ).notify(ready, lambda m, n, k: (0,))
+    kernel.tile(
+        "consumer",
+        EmptyTile(),
+        (1, 1, 1),
+        reads=[tensor.region(lambda m, n, k: R[1])],
+    ).wait(ready, lambda m, n, k: (0,))
+
+    with pytest.raises(
+        ValueError,
+        match=r"waits on event 'ready' coord \(0,\).*reads tensor 'x' region \[1\]",
+    ):
+        _validate(kernel)
+
+
+def test_semantic_accepts_shifted_region_dependency_when_wait_coord_matches_writer():
+    kernel = KernelSpec("semantic_shifted_region_dep")
+    tensor = kernel.tensor("x", (4,), "float32")
+    ready = kernel.event("ready", (4,), init_count=1)
+
+    kernel.tile(
+        "producer",
+        EmptyTile(),
+        (4, 1, 1),
+        writes=[tensor.region(lambda m, n, k: R[m])],
+    ).notify(ready, lambda m, n, k: (m,))
+    kernel.tile(
+        "consumer",
+        EmptyTile(),
+        (3, 1, 1),
+        reads=[tensor.region(lambda m, n, k: R[m + 1])],
+    ).wait(ready, lambda m, n, k: (m + 1,))
+
+    _validate(kernel)
+
+
+def test_semantic_rejects_shifted_region_dependency_when_wait_coord_is_wrong():
+    kernel = KernelSpec("semantic_shifted_region_wrong_wait")
+    tensor = kernel.tensor("x", (4,), "float32")
+    ready = kernel.event("ready", (4,), init_count=1)
+
+    kernel.tile(
+        "producer",
+        EmptyTile(),
+        (4, 1, 1),
+        writes=[tensor.region(lambda m, n, k: R[m])],
+    ).notify(ready, lambda m, n, k: (m,))
+    kernel.tile(
+        "consumer",
+        EmptyTile(),
+        (3, 1, 1),
+        reads=[tensor.region(lambda m, n, k: R[m + 1])],
+    ).wait(ready, lambda m, n, k: (m,))
+
+    with pytest.raises(
+        ValueError,
+        match=r"reads tensor 'x' region \[1\].*producer' idx \(1, 0, 0\).*without an event dependency",
+    ):
+        _validate(kernel)
+
+
+def test_semantic_rejects_region_read_without_event_dependency():
+    kernel = KernelSpec("semantic_region_no_event_dep")
+    tensor = kernel.tensor("x", (4,), "float32")
+
+    kernel.tile(
+        "producer", EmptyTile(), (4, 1, 1), writes=[tensor.region(lambda m, n, k: R[m])]
+    )
+    kernel.tile(
+        "consumer", EmptyTile(), (4, 1, 1), reads=[tensor.region(lambda m, n, k: R[m])]
+    )
+
+    with pytest.raises(ValueError, match="without an event dependency"):
+        _validate(kernel)
+
+
+def test_semantic_rejects_region_out_of_bounds():
+    kernel = KernelSpec("semantic_region_oob")
+    tensor = kernel.tensor("x", (4,), "float32")
+    ready = kernel.event("ready", (4,), init_count=1)
+
+    kernel.tile(
+        "producer", EmptyTile(), (4, 1, 1), writes=[tensor.region(lambda m, n, k: R[m])]
+    ).notify(ready, lambda m, n, k: (m,))
+    kernel.tile(
+        "consumer", EmptyTile(), (4, 1, 1), reads=[tensor.region(lambda m, n, k: R[4])]
+    ).wait(ready, lambda m, n, k: (m,))
+
+    with pytest.raises(ValueError, match="out of bounds"):
+        _validate(kernel)
+
+
+def test_semantic_accepts_range_region_dependency_covered_by_event():
+    kernel = KernelSpec("semantic_range_region_dep")
+    tensor = kernel.tensor("x", (2, 16), "float32")
+    ready = kernel.event("ready", (2,), init_count=1)
+
+    kernel.tile(
+        "producer",
+        EmptyTile(),
+        (2, 1, 1),
+        writes=[tensor.region(lambda m, n, k: R[m, 0:16])],
+    ).notify(ready, lambda m, n, k: (m,))
+    kernel.tile(
+        "consumer",
+        EmptyTile(),
+        (2, 1, 1),
+        reads=[tensor.region(lambda m, n, k: R[m, 4:12])],
+    ).wait(ready, lambda m, n, k: (m,))
+
+    _validate(kernel)
+
+
+def test_semantic_accepts_partially_overlapping_region_with_event_dependency():
+    kernel = KernelSpec("semantic_range_region_partial_overlap")
+    tensor = kernel.tensor("x", (16,), "float32")
+    ready = kernel.event("ready", (1,), init_count=1)
+
+    kernel.tile(
+        "producer", EmptyTile(), (1, 1, 1), writes=[tensor.region(lambda m, n, k: R[0:8])]
+    ).notify(ready, lambda m, n, k: (0,))
+    kernel.tile(
+        "consumer", EmptyTile(), (1, 1, 1), reads=[tensor.region(lambda m, n, k: R[4:12])]
+    ).wait(ready, lambda m, n, k: (0,))
+
+    _validate(kernel)
+
+
+def test_semantic_dynamic_write_conservatively_covers_static_read():
+    kernel = KernelSpec("semantic_dynamic_write")
+    tensor = kernel.tensor("x", (16,), "float32")
+    ready = kernel.event("ready", (1,), init_count=1)
+
+    kernel.tile(
+        "producer", EmptyTile(), (1, 1, 1), writes=[tensor.region(dynamic=True, reason="runtime index")]
+    ).notify(ready, lambda m, n, k: (0,))
+    kernel.tile(
+        "consumer", EmptyTile(), (1, 1, 1), reads=[tensor.region(lambda m, n, k: R[4:8])]
+    ).wait(ready, lambda m, n, k: (0,))
+
+    _validate(kernel)
+
+
+def test_semantic_dynamic_read_requires_event_dependency_from_writer():
+    kernel = KernelSpec("semantic_dynamic_read_no_dep")
+    tensor = kernel.tensor("x", (16,), "float32")
+
+    kernel.tile(
+        "producer", EmptyTile(), (1, 1, 1), writes=[tensor.region(lambda m, n, k: R[0:16])]
+    )
+    kernel.tile(
+        "consumer", EmptyTile(), (1, 1, 1), reads=[tensor.region(dynamic=True, reason="runtime index")]
+    )
+
+    with pytest.raises(ValueError, match="without an event dependency"):
+        _validate(kernel)
+
+
+def test_semantic_accepts_multiple_producers_for_one_event_coord():
+    kernel = KernelSpec("semantic_multi_producer")
+    tensor = kernel.tensor("x", (4,), "float32")
+    ready = kernel.event("ready", (4,), init_count=2)
+
+    kernel.tile("producer_a", EmptyTile(), (4, 1, 1), reads=[_r1(tensor)]).notify(
+        ready, lambda m, n, k: (m,)
+    )
+    kernel.tile("producer_b", EmptyTile(), (4, 1, 1), reads=[_r1(tensor)]).notify(
+        ready, lambda m, n, k: (m,)
+    )
+    kernel.tile("consumer", EmptyTile(), (4, 1, 1), reads=[_r1(tensor)]).wait(
+        ready, lambda m, n, k: (m,)
+    )
+
+    plan = _validate(kernel)
+
+    assert sorted((edge.producer.name, edge.consumer.name) for edge in plan.logical_edges) == [
+        ("producer_a", "consumer"),
+        ("producer_b", "consumer"),
+    ]
+
+
+def test_semantic_accepts_multiple_consumers_waiting_on_one_event_coord():
+    kernel = KernelSpec("semantic_multi_consumer")
+    tensor = kernel.tensor("x", (4,), "float32")
+    ready = kernel.event("ready", (4,), init_count=1)
+
+    kernel.tile("producer", EmptyTile(), (4, 1, 1), reads=[_r1(tensor)]).notify(
+        ready, lambda m, n, k: (m,)
+    )
+    kernel.tile("consumer_a", EmptyTile(), (4, 1, 1), reads=[_r1(tensor)]).wait(
+        ready, lambda m, n, k: (m,)
+    )
+    kernel.tile("consumer_b", EmptyTile(), (4, 1, 1), reads=[_r1(tensor)]).wait(
+        ready, lambda m, n, k: (m,)
+    )
+
+    plan = _validate(kernel)
+
+    assert sorted((edge.producer.name, edge.consumer.name) for edge in plan.logical_edges) == [
+        ("producer", "consumer_a"),
+        ("producer", "consumer_b"),
+    ]
+
+
+def test_semantic_rejects_duplicate_notify_event_on_one_tile():
+    kernel = KernelSpec("semantic_duplicate_notify_event")
+    tensor = kernel.tensor("x", (4,), "float32")
+    ready = kernel.event("ready", (4,), init_count=2)
+
+    producer = kernel.tile("producer", EmptyTile(), (4, 1, 1), reads=[_r1(tensor)])
+    producer.notify(ready, lambda m, n, k: (m,))
+    producer.notify(ready, lambda m, n, k: (m,))
+    kernel.tile("consumer", EmptyTile(), (4, 1, 1), reads=[_r1(tensor)]).wait(
+        ready, lambda m, n, k: (m,)
+    )
+
+    with pytest.raises(ValueError, match="notifies event .* more than once"):
+        _validate(kernel)
+
+
+def test_semantic_rejects_duplicate_wait_event_on_one_tile():
+    kernel = KernelSpec("semantic_duplicate_wait_event")
+    tensor = kernel.tensor("x", (4,), "float32")
+    ready = kernel.event("ready", (4,), init_count=1)
+
+    kernel.tile("producer", EmptyTile(), (4, 1, 1), reads=[_r1(tensor)]).notify(
+        ready, lambda m, n, k: (m,)
+    )
+    consumer = kernel.tile("consumer", EmptyTile(), (4, 1, 1), reads=[_r1(tensor)])
+    consumer.wait(ready, lambda m, n, k: (m,))
+    consumer.wait(ready, lambda m, n, k: (m,))
+
+    with pytest.raises(ValueError, match="waits on event .* more than once"):
+        _validate(kernel)

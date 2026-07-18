@@ -72,7 +72,7 @@ Registers a logical tensor.
 Parameters:
 
 - `name`: tensor name, unique inside the kernel.
-- `shape`: tensor shape.  Each dimension can be an `int` or `VarSpec`.
+- `shape`: tensor shape.  Each dimension can be an `int`, `VarSpec`, or a small `VarSpec` expression such as `M + 1` or `M.ceildiv(128)`.
 - `dtype`: tensor element type.
 
 Returns: `TensorSpec`.
@@ -101,7 +101,7 @@ Registers a logical event tensor.
 Parameters:
 
 - `name`: event name, unique inside the kernel.
-- `shape`: event tensor shape.  Each dimension can be an `int` or `VarSpec`.
+- `shape`: event tensor shape.  Each dimension can be an `int`, `VarSpec`, or a small `VarSpec` expression such as `M + 1` or `M.ceildiv(128)`.
 - `init_count`: logical count for each event coordinate.  This can be a single
   integer for a uniform count, or a callable that returns the count for a given
   event coordinate.
@@ -146,8 +146,8 @@ Parameters:
 - `name`: tile stage name, unique inside the kernel.
 - `impl`: local tile implementation object.
 - `tile_num`: tile count on `(m, n, k)` axes.  Use `1` for unused axes.
-- `reads`: tensors read by this tile.
-- `writes`: tensors written by this tile.
+- `reads`: tensors or tensor region accesses read by this tile.  Use `tensor.region(...)` when semantic region validation should check the access.
+- `writes`: tensors or tensor region accesses written by this tile.  Use `tensor.region(...)` when semantic region validation should check the access.
 - `attrs`: optional metadata reserved for later passes.
 
 Returns: `TileSpec`.
@@ -160,8 +160,8 @@ tile_a = kernel.tile(
     "tile_a",
     tile_a_impl,
     tile_num=(bs, 16, 1),
-    reads=[A],
-    writes=[B],
+    reads=[A.region(lambda m, n, k: R[m, n])],
+    writes=[B.region(lambda m, n, k: R[m, n])],
 )
 ```
 
@@ -228,11 +228,11 @@ implementation code and the later megakernel lowering pass.
 At the DSL level, `SmemManager` has two responsibilities:
 
 - Allocate logical shared-memory buffers and record their metadata.
-- Emit abstract shared-memory phase markers.
+- Emit coarse shared-memory phase operations.
 
 It does not expose physical pages, chunks, or concrete mbarrier operations to
-users.  Those are lowering details handled after the DSL and tile
-implementation are combined.
+users.  The current lowering maps the coarse phase operations onto chunk-level
+mbarriers internally.
 
 ### `SmemManager.__init__`
 
@@ -275,7 +275,7 @@ physical shared-memory layout.
 `policy` describes the intended lifetime and reuse behavior:
 
 - `"shared"`: default.  The buffer participates in coarse shared-memory phases
-  marked by `acquire_all()` and `release_all()`.
+  marked by `wait_all()` and `release_all()`.
 - `"persistent"`: the buffer is live for the whole megakernel and is not
   intended to participate in phase-based reuse.  This is useful for long-lived
   runtime state such as barriers or counters.
@@ -293,40 +293,33 @@ Finalizes the underlying shared-memory pool size annotation after all managed
 allocations have been declared.  In normal DSL usage this should be called by
 the lowering flow, not manually inside the tile computation body.
 
-### `SmemManager.acquire_all`
+### `SmemManager.wait_all`
 
 ```python
-smem_manager.acquire_all()
+smem_manager.wait_all(level="cta")
 ```
 
-Emits a marker for the beginning of a coarse shared-memory phase.  Managed
-shared-memory buffers used after this marker and before the matching
-`release_all()` are treated as live in the same phase.
+Begins a coarse shared-memory phase.  Managed shared-memory buffers used after
+this call and before the matching `release_all()` are treated as live in the
+same phase.
 
-This method only emits an abstract marker:
+The current TIRX lowering implements this by waiting on every managed
+shared-memory chunk mbarrier at CTA scope.  Only `level="cta"` is supported for
+now; users do not address chunks directly.
 
-```python
-T.call_extern("void", "tirx.megakernel.smem.wait_all")
-```
-
-The lowering pass is responsible for replacing that marker with the final
-synchronization implementation.
+Any tile that allocates non-persistent managed shared memory must call
+`wait_all()` before using that memory and `release_all()` after it is no longer
+needed.  The lowering rejects such tiles if either call is missing.
 
 ### `SmemManager.release_all`
 
 ```python
-smem_manager.release_all()
+smem_manager.release_all(level="cta")
 ```
 
-Emits a marker for the end of the current coarse shared-memory phase:
-
-```python
-T.call_extern("void", "tirx.megakernel.smem.release_all")
-```
-
-The method does not emit concrete synchronization by itself.  The lowering pass
-uses this marker together with the allocation records to generate or optimize
-the final mbarrier/page logic.
+Ends the current coarse shared-memory phase.  The current TIRX lowering emits
+a chunk-level mbarrier arrive for the managed chunks at CTA scope.  Only
+`level="cta"` is supported for now.
 
 ### `SmemManager.advance`
 
@@ -334,14 +327,10 @@ the final mbarrier/page logic.
 smem_manager.advance()
 ```
 
-Emits a marker for advancing the logical shared-memory phase:
-
-```python
-T.call_extern("void", "tirx.megakernel.smem.advance")
-```
-
-This keeps phase movement explicit in the tile implementation while leaving the
-physical phase representation to lowering.
+Advances the logical shared-memory phase.  In the current TIRX lowering this
+flips the manager's local mbarrier phase bit.  Tile implementations should call
+this after releasing a phase when they intend later work to acquire the next
+phase.
 
 ## `TileImpl`
 
@@ -474,15 +463,15 @@ stage1 = kernel.tile(
     "stage1",
     Stage1Tile(),
     tile_num=(NUM_BLOCK_M, NUM_BLOCK_N, 1),
-    reads=[A],
-    writes=[B],
+    reads=[A.region(lambda m, n, k: R[m, n])],
+    writes=[B.region(lambda m, n, k: R[m, n])],
 ).notify(row_ready, lambda m, n, k: (m,))
 
 stage2 = kernel.tile(
     "stage2",
     Stage2Tile(),
     tile_num=(NUM_BLOCK_M, 1, 1),
-    reads=[B],
-    writes=[C],
+    reads=[B.region(lambda m, n, k: R[m, 0:NUM_BLOCK_N])],
+    writes=[C.region(lambda m, n, k: R[m])],
 ).wait(row_ready, lambda m, n, k: (m,))
 ```
