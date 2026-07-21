@@ -2,15 +2,26 @@
 
 This document lists the user-facing API in `tvm.megakernel.dsl`.
 
-## DSL Layers
+## Public Entry Points
+
+The top-level `tvm.megakernel.dsl` module exposes the user entry points only:
+
+```python
+from tvm.megakernel.dsl import KernelSpec, R, TileImpl, SmemManager
+```
 
 The DSL has two layers:
 
-- Spec layer: `KernelSpec`, `TensorSpec`, `EventSpec`, and `TileSpec`.  This
-  layer describes tile stages, tensor inputs/outputs, logical events, and
-  wait/notify dependencies.
-- Impl layer: `TileImpl`.  This layer connects a logical tile to the concrete
-  implementation of that tile.
+- Spec layer: `KernelSpec` and `R`.  This layer describes tile stages, tensor
+  inputs/outputs, logical events, and wait/notify dependencies.  Objects such
+  as `TensorSpec`, `EventSpec`, and `TileSpec` are returned by `KernelSpec`
+  builder methods; users should not construct them directly.
+- Impl layer: `TileImpl` and `SmemManager`.  This layer connects a logical tile
+  to the concrete implementation of that tile.
+
+Internal spec helper types live under `tvm.megakernel.dsl.spec`.  Internal impl
+helper types live under `tvm.megakernel.dsl.impl`.  The top-level module should
+remain a small user API facade.
 
 The spec layer corresponds to Step 3 in [workflow.md](workflow.md).  The impl
 layer corresponds to Step 4.
@@ -38,11 +49,11 @@ kernel = KernelSpec("two_stage_reduce", attrs={"target": "sm90"})
 ## `KernelSpec.var`
 
 ```python
-var = kernel.var(name: str, dtype: str = "int32")
+var = kernel.var(name: str, dtype: str = "int32", bounds: tuple[int, int] | None = None)
 ```
 
 Registers a symbolic integer variable that can be used in tensor shapes, event
-shapes, and tile counts.  The current TIRX lowering emits each symbolic
+shapes, and grid shapes.  The current TIRX lowering emits each symbolic
 variable as a local symbolic variable in the PrimFunc body using the `VarSpec`
 dtype, for example `M = T.int32()`, instead of exposing it as a kernel
 parameter.
@@ -51,13 +62,14 @@ Parameters:
 
 - `name`: symbolic variable name, unique inside the kernel.
 - `dtype`: scalar dtype used by lowering.  Defaults to `"int32"`.
+- `bounds`: optional inclusive `(min, max)` bounds for this symbolic value.  Passes that need static allocation or bounded sampling require this.
 
 Returns: `VarSpec`.
 
 Example:
 
 ```python
-M = kernel.var("M", dtype="int32")
+M = kernel.var("M", dtype="int32", bounds=(1, 1024))
 A = kernel.tensor("A", shape=(M, 1024), dtype="float32")
 ```
 
@@ -80,7 +92,7 @@ Returns: `TensorSpec`.
 Example:
 
 ```python
-bs = kernel.var("bs")
+bs = kernel.var("bs", bounds=(1, 1024))
 A = kernel.tensor("A", shape=(bs, 1024), dtype="float32")
 ```
 
@@ -90,7 +102,7 @@ A = kernel.tensor("A", shape=(bs, 1024), dtype="float32")
 event = kernel.event(
     name: str,
     shape: ShapeType,
-    init_count: int | Callable[[tuple[int, ...]], int],
+    init_count: int | Callable[..., int],
     dtype: str = "int32",
     attrs: dict[str, Any] | None = None,
 )
@@ -102,8 +114,8 @@ Parameters:
 
 - `name`: event name, unique inside the kernel.
 - `shape`: event tensor shape.  Each dimension can be an `int`, `VarSpec`, or a small `VarSpec` expression such as `M + 1` or `M.ceildiv(128)`.
-- `init_count`: logical count for each event coordinate.  This can be a single
-  integer for a uniform count, or a callable that returns the count for a given
+- `init_count`: logical non-negative count for each event coordinate.  This can be a single
+  integer for a uniform count, or a callable whose arguments are the expanded
   event coordinate.
 - `dtype`: event storage dtype.  Defaults to `"int32"`.
 - `attrs`: optional metadata reserved for later passes.
@@ -122,7 +134,7 @@ evt1 = kernel.event(
 evt2 = kernel.event(
     "evt2",
     shape=(100, 200),
-    init_count=lambda coord: coord[0] + coord[1],
+    init_count=lambda i, j: i + j,
 )
 ```
 
@@ -132,7 +144,7 @@ evt2 = kernel.event(
 tile = kernel.tile(
     name: str,
     impl: TileImpl,
-    tile_num: TileNumType,
+    grid: GridType,
     reads: list[TensorSpec] | None = None,
     writes: list[TensorSpec] | None = None,
     attrs: dict[str, Any] | None = None,
@@ -145,7 +157,7 @@ Parameters:
 
 - `name`: tile stage name, unique inside the kernel.
 - `impl`: local tile implementation object.
-- `tile_num`: tile count on `(m, n, k)` axes.  Use `1` for unused axes.
+- `grid`: grid shape on `(m, n, k)` axes.  Use `1` for unused axes.
 - `reads`: tensors or tensor region accesses read by this tile.  Use `tensor.region(...)` when semantic region validation should check the access.
 - `writes`: tensors or tensor region accesses written by this tile.  Use `tensor.region(...)` when semantic region validation should check the access.
 - `attrs`: optional metadata reserved for later passes.
@@ -155,11 +167,11 @@ Returns: `TileSpec`.
 Example:
 
 ```python
-bs = kernel.var("bs")
+bs = kernel.var("bs", bounds=(1, 1024))
 tile_a = kernel.tile(
     "tile_a",
     tile_a_impl,
-    tile_num=(bs, 16, 1),
+    grid=(bs, 16, 1),
     reads=[A.region(lambda m, n, k: R[m, n])],
     writes=[B.region(lambda m, n, k: R[m, n])],
 )
@@ -168,18 +180,25 @@ tile_a = kernel.tile(
 ## `TileSpec.wait`
 
 ```python
-tile.wait(event: EventSpec, coord_map: CoordMapType)
+tile.wait(
+    event: EventSpec,
+    coord: CoordMapType,
+    inverse_coord: CoordMapType | None = None,
+)
 ```
 
 Declares that this tile waits on `event` at the coordinate produced by
-`coord_map`.
+`coord`.
 
 Parameters:
 
 - `event`: event to wait on.
-- `coord_map`: callable mapping tile index `(m, n, k)` to an event
+- `coord`: callable mapping tile index `(m, n, k)` to an event
   coordinate.  If it is a tuple/list instead of a callable, it is used directly
   as the event coordinate.
+- `inverse_coord`: optional inverse mapping from event coordinate to
+  consumer tile index.  Dynamic scheduling requires this for every wait; static
+  scheduling does not.
 
 Returns: `TileSpec`.
 
@@ -188,23 +207,23 @@ Example:
 ```python
 tile_b.wait(
     event=evt1,
-    coord_map=lambda m, n, k: (m,),
+    coord=lambda m, n, k: (m,),
 )
 ```
 
 ## `TileSpec.notify`
 
 ```python
-tile.notify(event: EventSpec, coord_map: CoordMapType)
+tile.notify(event: EventSpec, coord: CoordMapType)
 ```
 
 Declares that this tile notifies `event` at the coordinate produced by
-`coord_map`.
+`coord`.
 
 Parameters:
 
 - `event`: event to notify.
-- `coord_map`: callable mapping tile index `(m, n, k)` to an event
+- `coord`: callable mapping tile index `(m, n, k)` to an event
   coordinate.  If it is a tuple/list instead of a callable, it is used directly
   as the event coordinate.
 
@@ -215,7 +234,7 @@ Example:
 ```python
 tile_a.notify(
     event=evt1,
-    coord_map=lambda m, n, k: (m,),
+    coord=lambda m, n, k: (m,),
 )
 ```
 
@@ -462,7 +481,7 @@ Required.  Defines the computation for one logical tile instance at index
 stage1 = kernel.tile(
     "stage1",
     Stage1Tile(),
-    tile_num=(NUM_BLOCK_M, NUM_BLOCK_N, 1),
+    grid=(NUM_BLOCK_M, NUM_BLOCK_N, 1),
     reads=[A.region(lambda m, n, k: R[m, n])],
     writes=[B.region(lambda m, n, k: R[m, n])],
 ).notify(row_ready, lambda m, n, k: (m,))
@@ -470,8 +489,8 @@ stage1 = kernel.tile(
 stage2 = kernel.tile(
     "stage2",
     Stage2Tile(),
-    tile_num=(NUM_BLOCK_M, 1, 1),
+    grid=(NUM_BLOCK_M, 1, 1),
     reads=[B.region(lambda m, n, k: R[m, 0:NUM_BLOCK_N])],
     writes=[C.region(lambda m, n, k: R[m])],
-).wait(row_ready, lambda m, n, k: (m,))
+).wait(row_ready, lambda m, n, k: (m,), inverse_coord=lambda m: (m, 0, 0))
 ```

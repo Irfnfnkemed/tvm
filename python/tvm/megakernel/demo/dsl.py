@@ -6,7 +6,7 @@ from tvm.megakernel.dsl import KernelSpec, R, TileImpl
 
 # Configuration parameters
 # M is symbolic to exercise VarSpec lowering in the main DSL demo.  The static
-# scheduler still needs a concrete tile count in this draft lowering path.
+# scheduler still needs a concrete grid shape in this draft lowering path.
 N = 1024
 
 BLOCK_M = 64
@@ -145,7 +145,7 @@ kernel = KernelSpec(
     },
 )
 
-M = kernel.var("M", range=(NUM_BLOCK_M * BLOCK_M, NUM_BLOCK_M * BLOCK_M))
+M = kernel.var("M", bounds=(NUM_BLOCK_M * BLOCK_M, NUM_BLOCK_M * BLOCK_M))
 
 A = kernel.tensor(
     "A",
@@ -182,7 +182,7 @@ stage1 = kernel.tile(
         block_m=BLOCK_M,
         block_n=BLOCK_N,
     ),
-    tile_num=(NUM_BLOCK_M, NUM_BLOCK_N, 1),
+    grid=(NUM_BLOCK_M, NUM_BLOCK_N, 1),
     reads=[
         A.region(
             lambda m, n, k: R[
@@ -195,7 +195,7 @@ stage1 = kernel.tile(
     attrs={
         "source_stage": "B = reduce_each_n_block(A)",
     },
-).notify(row_ready, coord_map=lambda m, n, k: (m,))
+).notify(row_ready, coord=lambda m, n, k: (m,))
 
 stage2 = kernel.tile(
     name="stage2_final_reduce",
@@ -205,10 +205,10 @@ stage2 = kernel.tile(
         block_m=BLOCK_M,
         num_block_n=NUM_BLOCK_N,
     ),
-    tile_num=(NUM_BLOCK_M, 1, 1),
+    grid=(NUM_BLOCK_M, 1, 1),
     reads=[B.region(lambda m, n, k: R[m * BLOCK_M : (m + 1) * BLOCK_M, 0:NUM_BLOCK_N])],
     writes=[C.region(lambda m, n, k: R[m * BLOCK_M : (m + 1) * BLOCK_M, 0])],
     attrs={
         "source_stage": "C = reduce_all_n_blocks(B)",
     },
-).wait(row_ready, coord_map=lambda m, n, k: (m,))
+).wait(row_ready, coord=lambda m, n, k: (m,))

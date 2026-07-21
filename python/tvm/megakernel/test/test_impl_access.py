@@ -135,8 +135,8 @@ def _prefetch_run_tensors():
 
 def _indexed_tensors():
     kernel = KernelSpec("indexed")
-    rows = kernel.var("rows", range=(2, 5))
-    groups = kernel.var("groups", range=(1, 3))
+    rows = kernel.var("rows", bounds=(2, 5))
+    groups = kernel.var("groups", bounds=(1, 3))
     cols = groups * 8 + 16
     return {
         "src": kernel.tensor("src", (rows, cols), "float32"),

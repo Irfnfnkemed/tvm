@@ -15,14 +15,40 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""Megakernel DSL user API."""
+"""Spec-layer building blocks for the megakernel DSL."""
 
-from .impl import SmemManager, TileImpl
-from .spec import KernelSpec, R
+from .core import (
+    CoordMapType,
+    DependencySpec,
+    EventSpec,
+    KernelSpec,
+    ShapeType,
+    TensorSpec,
+    GridType,
+    TileSpec,
+)
+from .expr import ExprLike, ExprSpec, VarSpec, eval_expr_like, expr_bounds, expr_vars
+from .region import R, RegionBuilder, RegionRange, RegionSpec, TileRegionMap, TileRegionResult
 
 __all__ = [
+    "CoordMapType",
+    "DependencySpec",
+    "EventSpec",
+    "ExprLike",
+    "ExprSpec",
     "KernelSpec",
     "R",
-    "SmemManager",
-    "TileImpl",
+    "RegionBuilder",
+    "RegionRange",
+    "RegionSpec",
+    "ShapeType",
+    "TensorSpec",
+    "GridType",
+    "TileSpec",
+    "TileRegionMap",
+    "TileRegionResult",
+    "VarSpec",
+    "eval_expr_like",
+    "expr_bounds",
+    "expr_vars",
 ]

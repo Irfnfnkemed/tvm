@@ -23,7 +23,7 @@ from typing import Any
 
 import tvm.tirx.script as T
 
-from ...dsl import EventSpec, ExprSpec, VarSpec
+from ...dsl.spec import EventSpec, ExprSpec, VarSpec
 from .prepare import EVENT_INIT_COMPLETE_NAME, INIT_EVENT_JOB_ID, WAIT_EVENT_INIT_JOB_ID
 from .scheduler import StaticTileScheduler, TIRXSemaphore
 
@@ -174,8 +174,8 @@ def emit_events(
         return
     for dependency in dependencies:
         event = dependency.event
-        coord_map = dependency.coord_from_tile
-        coord = coord_from_map(coord_map, m_idx, n_idx, k_idx)
+        coord = dependency.coord
+        coord = coord_from_map(coord, m_idx, n_idx, k_idx)
         if event.name not in event_bindings:
             if options.emit_event_markers:
                 emit_marker(marker, event.name, *coord)
@@ -262,18 +262,21 @@ def linear_index_to_coord(linear_idx, shape: tuple[int, ...]) -> tuple[Any, ...]
 
 
 def event_init_count(event: EventSpec, coord: tuple[Any, ...]):
-    if callable(event.init_count):
-        return event.init_count(coord)
-    return event.init_count
+    count = event.init_count(*coord)
+    if isinstance(count, bool) or not isinstance(count, int):
+        raise TypeError("event init_count must produce an integer")
+    if count < 0:
+        raise ValueError("event init_count must produce a non-negative integer")
+    return count
 
 
-def coord_from_map(coord_map, m_idx, n_idx, k_idx) -> tuple[Any, ...]:
-    if callable(coord_map):
-        coord = coord_map(m_idx, n_idx, k_idx)
+def coord_from_map(coord, m_idx, n_idx, k_idx) -> tuple[Any, ...]:
+    if callable(coord):
+        coord = coord(m_idx, n_idx, k_idx)
     else:
-        coord = coord_map
+        coord = coord
     if not isinstance(coord, (tuple, list)):
-        raise TypeError(f"coord_map must produce a tuple/list coordinate, got {coord!r}")
+        raise TypeError(f"coord must produce a tuple/list coordinate, got {coord!r}")
     return tuple(coord)
 
 

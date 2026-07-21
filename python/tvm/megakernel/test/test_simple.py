@@ -50,6 +50,23 @@ def _options():
     )
 
 
+class ValidateEmptyTile(TileImpl):
+    @T.inline
+    def run(self, m_idx, n_idx, k_idx):
+        T.evaluate(0)
+
+
+def test_kernel_validate_returns_semantic_plan():
+    kernel = KernelSpec("validate_entry")
+    x = kernel.tensor("x", (1,), "float32")
+    kernel.tile("only", ValidateEmptyTile(), (1, 1, 1), reads=[x])
+
+    plan = kernel.validate()
+
+    assert plan.kernel is kernel
+    assert [tile.name for tile in plan.tiles] == ["only"]
+
+
 class SumTile(TileImpl):
     def __init__(self, source, partial):
         super().__init__()
@@ -354,8 +371,8 @@ def _prefetch_options():
 
 def _build_prefetch_kernel(name, consumer_cls):
     kernel = KernelSpec(name)
-    rows = kernel.var("rows", range=(PREFETCH_M, PREFETCH_M))
-    cols = kernel.var("cols", range=(PREFETCH_N, PREFETCH_N))
+    rows = kernel.var("rows", bounds=(PREFETCH_M, PREFETCH_M))
+    cols = kernel.var("cols", bounds=(PREFETCH_N, PREFETCH_N))
     source = kernel.tensor("A", (rows, cols), "float32")
     independent = kernel.tensor("B", (PREFETCH_M, PREFETCH_N, PREFETCH_R, PREFETCH_C), "float32")
     tmp = kernel.tensor("tmp", (rows, cols), "float32")

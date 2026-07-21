@@ -76,7 +76,7 @@ tiles:
     source_stage: <source stage or expression>
     purpose: <short description of local computation>
     tile_impl: <suggested TileImpl class name or null>
-    tile_num: [<m_tiles>, <n_tiles>, <k_tiles>]
+    grid: [<m_tiles>, <n_tiles>, <k_tiles>]
     index_axes: [m, n, k]
     reads: [<tensor_name>, ...]
     writes: [<tensor_name>, ...]
@@ -105,10 +105,10 @@ dependencies:
     relation: <short producer-consumer relation>
     notify:
       tile: <producer_tile>
-      coord_map: [<event_coord_expr>, ...]
+      coord: [<event_coord_expr>, ...]
     wait:
       tile: <consumer_tile>
-      coord_map: [<event_coord_expr>, ...]
+      coord: [<event_coord_expr>, ...]
       expected: <logical_count>
 
 validation:
@@ -133,7 +133,7 @@ event is required.  Otherwise emit an event with `init: 1`.
 
 1. Identify staged operations in the same order as the input.
 2. Assign one logical tile stage per preserved stage.
-3. Pick `tile_num` using `[m, n, k]` axes.  Use extent `1` for unused axes.
+3. Pick `grid` using `[m, n, k]` axes.  Use extent `1` for unused axes.
 4. Record reads and writes for every tile.
 5. Build tensor producer/consumer metadata.
 6. Classify producer-consumer dependency multiplicity.
@@ -174,14 +174,14 @@ dependencies:
     relation: producer.m == consumer.m, all producer.n
     notify:
       tile: stage1_partial_reduce
-      coord_map: [m]
+      coord: [m]
     wait:
       tile: stage2_final_reduce
-      coord_map: [m]
+      coord: [m]
       expected: NUM_BLOCK_N
 ```
 
-The rank of `notify.coord_map` and `wait.coord_map` must equal the rank of
+The rank of `notify.coord` and `wait.coord` must equal the rank of
 `events.<event>.shape`.
 
 `wait.expected` must equal the number of producer tile instances mapped to the
@@ -219,7 +219,7 @@ tiles:
     source_stage: B = reduce_n_blocks(A)
     purpose: reduce each A[m-block, n-block] into B[m-block, n]
     tile_impl: Stage1ReduceTile
-    tile_num: [NUM_BLOCK_M, NUM_BLOCK_N, 1]
+    grid: [NUM_BLOCK_M, NUM_BLOCK_N, 1]
     index_axes: [m, n, k]
     reads: [A]
     writes: [B]
@@ -228,7 +228,7 @@ tiles:
     source_stage: C = reduce_block_results(B)
     purpose: reduce all partial values for each m-block
     tile_impl: Stage2ReduceTile
-    tile_num: [NUM_BLOCK_M, 1, 1]
+    grid: [NUM_BLOCK_M, 1, 1]
     index_axes: [m, n, k]
     reads: [B]
     writes: [C]
@@ -269,16 +269,16 @@ dependencies:
     relation: producer.m == consumer.m, all producer.n
     notify:
       tile: stage1_partial_reduce
-      coord_map: [m]
+      coord: [m]
     wait:
       tile: stage2_final_reduce
-      coord_map: [m]
+      coord: [m]
       expected: NUM_BLOCK_N
 
 validation:
   status: pass
   checks:
-    - every tile has tile_num and index_axes
+    - every tile has grid and index_axes
     - every tensor consumer has a producer or is an input
     - row_ready has rank 1 and both coord maps have rank 1
     - wait.expected equals NUM_BLOCK_N producer tiles per m-block

@@ -23,7 +23,7 @@ import keyword
 import re
 from typing import Any
 
-from ...dsl import (
+from ...dsl.spec import (
     EventSpec,
     ExprSpec,
     KernelSpec,
@@ -97,7 +97,7 @@ class TilePlan:
     """Tile binding consumed by the TIRX emitter."""
 
     info: TileLoweringInfo
-    tile_num: Any
+    grid: Any
     waits: tuple[tuple[EventSpec, Any], ...]
     notifies: tuple[tuple[EventSpec, Any], ...]
 
@@ -116,7 +116,7 @@ class TaskPhase:
 
     kind: str
     job_id: int
-    tile_num: Any
+    grid: Any
     label: str
 
 
@@ -136,7 +136,7 @@ class StaticSchedulePlan:
                 {
                     "kind": phase.kind,
                     "job_id": phase.job_id,
-                    "tile_num": _data_value(phase.tile_num),
+                    "grid": _data_value(phase.grid),
                     "label": phase.label,
                 }
                 for phase in self.phases
@@ -151,8 +151,8 @@ class DynamicTrigger:
     event: EventSpec
     producer: TilePlan
     consumer: TilePlan
-    consumer_coord_map: Any
-    consumer_inverse_coord_map: Any | None
+    consumer_coord: Any
+    consumer_inverse_coord: Any | None
 
 
 @dataclass(frozen=True)
@@ -173,7 +173,7 @@ class DynamicSchedulePlan:
                 {
                     "kind": phase.kind,
                     "job_id": phase.job_id,
-                    "tile_num": _data_value(phase.tile_num),
+                    "grid": _data_value(phase.grid),
                     "label": phase.label,
                 }
                 for phase in self.entry_phases
@@ -184,7 +184,7 @@ class DynamicSchedulePlan:
                         "event": trigger.event.name,
                         "producer": trigger.producer.tile.name,
                         "consumer": trigger.consumer.tile.name,
-                        "has_inverse_coord_map": trigger.consumer_inverse_coord_map is not None,
+                        "has_inverse_coord": trigger.consumer_inverse_coord is not None,
                     }
                     for trigger in triggers
                 ]
@@ -261,7 +261,7 @@ class LoweringPlan:
                 {
                     "name": tile_plan.tile.name,
                     "job_id": tile_plan.job_id,
-                    "tile_num": _data_value(tile_plan.tile_num),
+                    "grid": _data_value(tile_plan.grid),
                     "waits": [{"event": dep.event.name} for dep in tile_plan.waits],
                     "notifies": [{"event": dep.event.name} for dep in tile_plan.notifies],
                 }
@@ -455,7 +455,7 @@ def _build_tile_plans(plan: LoweringPlan) -> None:
         tile = tile_info.tile
         tile_plan = TilePlan(
             info=tile_info,
-            tile_num=tile.tile_num,
+            grid=tile.grid,
             waits=tuple(tile.waits),
             notifies=tuple(tile.notifies),
         )
@@ -476,7 +476,7 @@ def _build_static_schedule_plan(plan: LoweringPlan) -> None:
             TaskPhase(
                 kind="grid",
                 job_id=INIT_EVENT_JOB_ID,
-                tile_num=(len(plan.event_layouts) + 1, 1, 1),
+                grid=(len(plan.event_layouts) + 1, 1, 1),
                 label="init_event",
             )
         )
@@ -491,7 +491,7 @@ def _build_static_schedule_plan(plan: LoweringPlan) -> None:
             TaskPhase(
                 kind="grid",
                 job_id=WAIT_EVENT_INIT_JOB_ID,
-                tile_num=(sm_count, 1, 1),
+                grid=(sm_count, 1, 1),
                 label="wait_event_init",
             )
         )
@@ -499,7 +499,7 @@ def _build_static_schedule_plan(plan: LoweringPlan) -> None:
     for tile_plan in rest_tiles:
         phases.append(_tile_phase(tile_plan))
 
-    phases.append(TaskPhase(kind="grid", job_id=end_job_id, tile_num=(sm_count, 1, 1), label="end"))
+    phases.append(TaskPhase(kind="grid", job_id=end_job_id, grid=(sm_count, 1, 1), label="end"))
     plan.static_schedule = StaticSchedulePlan(
         phases=tuple(phases), max_tasks=max_tasks, end_job_id=end_job_id
     )
@@ -530,8 +530,8 @@ def _build_dynamic_schedule_plan(plan: LoweringPlan) -> None:
                             event=notify_event,
                             producer=producer,
                             consumer=tile_plan_by_tile[id(consumer_tile)],
-                            consumer_coord_map=wait_dep.coord_from_tile,
-                            consumer_inverse_coord_map=wait_dep.inverse_coord_from_event,
+                            consumer_coord=wait_dep.coord,
+                            consumer_inverse_coord=wait_dep.inverse_coord,
                         )
                     )
         if producer_triggers:
@@ -550,7 +550,7 @@ def _tile_phase(tile_plan: TilePlan) -> TaskPhase:
     return TaskPhase(
         kind="grid",
         job_id=tile_plan.job_id,
-        tile_num=tile_plan.tile_num,
+        grid=tile_plan.grid,
         label=tile_plan.tile.name,
     )
 

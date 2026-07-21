@@ -28,7 +28,8 @@ from tvm.tirx import Buffer, BufferLoad, BufferRegion, Call, PrimExpr, Stmt, Til
 from tvm.tirx.expr_functor import ExprVisitor
 from tvm.tirx.stmt_functor import StmtVisitor
 
-from ...dsl import RegionRange, RegionSpec, TensorSpec, TileImpl, expr_bounds
+from ...dsl.impl import TileImpl
+from ...dsl.spec import RegionRange, RegionSpec, TensorSpec, expr_bounds
 
 
 @dataclass(frozen=True)

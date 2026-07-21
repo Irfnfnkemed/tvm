@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from itertools import product
 
-from ...dsl import RegionRange, RegionSpec
+from ...dsl.spec import RegionRange, RegionSpec
 
 
 def regions_overlap(lhs: RegionSpec | None, rhs: RegionSpec | None) -> bool:

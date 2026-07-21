@@ -33,7 +33,7 @@ from tvm.ir.module import IRModule
 import tvm.tirx.script as T
 from tvm.tirx import PrimFunc
 
-from ...dsl import KernelSpec, TensorSpec, VarSpec
+from ...dsl.spec import KernelSpec, TensorSpec, VarSpec
 from ..semantic import build_semantic_plan, validate_semantic_plan
 from .prepare import (
     INIT_EVENT_JOB_ID,
@@ -495,14 +495,14 @@ class StaticQueueInitBuilder:
                     T.buffer_store(idx, idx[0] + phase_count, [0])
 
     def _phase_count(self, plan: KernelLoweringPlan, phase: TaskPhase) -> Any:
-        tile_num = _shape_tuple(phase.tile_num, f"phase {phase.label} tile_num", plan)
-        return _shape_product(tile_num)
+        grid = _shape_tuple(phase.grid, f"phase {phase.label} grid", plan)
+        return _shape_product(grid)
 
     def _emit_phase(
         self, plan: KernelLoweringPlan, queue, idx, phase: TaskPhase, sm_count: int
     ) -> None:
-        tile_num = _shape_tuple(phase.tile_num, f"phase {phase.label} tile_num", plan)
-        for_grid = T.grid(*tile_num)
+        grid = _shape_tuple(phase.grid, f"phase {phase.label} grid", plan)
+        for_grid = T.grid(*grid)
         m_idx, n_idx, k_idx = for_grid.__enter__()
         packed = _pack_static_task(m_idx, n_idx, k_idx, phase.job_id)
         T.buffer_store(queue, packed, [idx[0] % sm_count, idx[0] // sm_count])
@@ -571,15 +571,15 @@ class DynamicQueueInitBuilder:
                 with T.Then():
                     with T.If(tx == 0):
                         with T.Then():
-                            tile_num = _shape_tuple(phase.tile_num, f"phase {phase.label} tile_num", plan)
-                            for_grid = T.grid(*tile_num)
+                            grid = _shape_tuple(phase.grid, f"phase {phase.label} grid", plan)
+                            for_grid = T.grid(*grid)
                             m_idx, n_idx, k_idx = for_grid.__enter__()
                             T.buffer_store(tasks, _pack_task(m_idx, n_idx, k_idx, phase.job_id), [idx[0]])
                             T.buffer_store(idx, idx[0] + 1, [0])
                             for_grid.__exit__(None, None, None)
                 with T.Else():
-                    tile_num = _shape_tuple(phase.tile_num, f"phase {phase.label} tile_num", plan)
-                    T.buffer_store(idx, idx[0] + _shape_product(tile_num), [0])
+                    grid = _shape_tuple(phase.grid, f"phase {phase.label} grid", plan)
+                    T.buffer_store(idx, idx[0] + _shape_product(grid), [0])
         with T.If(bx >= len(plan.dynamic_schedule.entry_phases)):
             with T.Then():
                 clear_idx = T.alloc_buffer((1,), "int32", scope="local")
@@ -661,8 +661,8 @@ def emit_static_waits(
 ) -> None:
     for dependency in waits:
         event = dependency.event
-        coord_map = dependency.coord_from_tile
-        coord = coord_from_map(coord_map, m_idx, n_idx, k_idx)
+        coord = dependency.coord
+        coord = coord_from_map(coord, m_idx, n_idx, k_idx)
         if event.name not in event_bindings:
             if options.emit_event_markers:
                 emit_marker(EVENT_WAIT_MARKER, event.name, *coord)
@@ -688,8 +688,8 @@ def emit_static_notifies(
 ) -> None:
     for dependency in notifies:
         event = dependency.event
-        coord_map = dependency.coord_from_tile
-        coord = coord_from_map(coord_map, m_idx, n_idx, k_idx)
+        coord = dependency.coord
+        coord = coord_from_map(coord, m_idx, n_idx, k_idx)
         if event.name not in event_bindings:
             if options.emit_event_markers:
                 emit_marker(EVENT_NOTIFY_MARKER, event.name, *coord)
@@ -720,8 +720,8 @@ def emit_dynamic_waits(
 ) -> None:
     for dependency in waits:
         event = dependency.event
-        coord_map = dependency.coord_from_tile
-        coord = coord_from_map(coord_map, m_idx, n_idx, k_idx)
+        coord = dependency.coord
+        coord = coord_from_map(coord, m_idx, n_idx, k_idx)
         if event.name not in event_bindings:
             if options.emit_event_markers:
                 emit_marker(EVENT_WAIT_MARKER, event.name, *coord)
@@ -750,8 +750,8 @@ def emit_dynamic_pre_notify_and_pushes(
         return
     for dependency in notifies:
         event = dependency.event
-        coord_map = dependency.coord_from_tile
-        coord = coord_from_map(coord_map, m_idx, n_idx, k_idx)
+        coord = dependency.coord
+        coord = coord_from_map(coord, m_idx, n_idx, k_idx)
         if event.name not in event_bindings:
             if options.emit_event_markers:
                 emit_marker(EVENT_NOTIFY_MARKER, event.name, *coord)
@@ -801,8 +801,8 @@ def emit_dynamic_complete_notifies(
 ) -> None:
     for dependency in notifies:
         event = dependency.event
-        coord_map = dependency.coord_from_tile
-        coord = coord_from_map(coord_map, m_idx, n_idx, k_idx)
+        coord = dependency.coord
+        coord = coord_from_map(coord, m_idx, n_idx, k_idx)
         if event.name not in event_bindings:
             if options.emit_event_markers:
                 emit_marker(EVENT_NOTIFY_MARKER, event.name, *coord)
@@ -834,15 +834,15 @@ def emit_dynamic_endpoint_end_tasks(scheduler, plan, tile_plan, _m_idx, _n_idx, 
 
 
 def _consumer_task_coord_from_event(trigger, event_coord):
-    inverse_coord_map = trigger.consumer_inverse_coord_map
-    if inverse_coord_map is None:
-        raise ValueError("dynamic trigger requires consumer_inverse_coord_map")
-    if callable(inverse_coord_map):
-        coord = inverse_coord_map(*event_coord)
+    inverse_coord = trigger.consumer_inverse_coord
+    if inverse_coord is None:
+        raise ValueError("dynamic trigger requires consumer_inverse_coord")
+    if callable(inverse_coord):
+        coord = inverse_coord(*event_coord)
     else:
-        coord = inverse_coord_map
+        coord = inverse_coord
     if not isinstance(coord, (tuple, list)) or len(coord) != 3:
-        raise TypeError("inverse_coord_from_event must produce a 3D consumer tile coordinate")
+        raise TypeError("inverse_coord must produce a 3D consumer tile coordinate")
     return tuple(coord)
 
 def _emit_local_symbolic_vars(plan: KernelLoweringPlan) -> None:

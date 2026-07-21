@@ -97,7 +97,7 @@ The spec layer mainly records:
 ```text
 1. tensors in the megakernel spec
 2. logical events and their initial counts
-3. tile stages and their tile_num
+3. tile stages and their grid
 4. each tile's input tensors
 5. each tile's output tensors
 6. each tile's wait/notify dependencies
@@ -116,10 +116,10 @@ EventSpec:
   logical event name, shape, init_count, dtype, attrs
 
 DependencySpec:
-  wait/notify endpoint with an event and coord_map
+  wait/notify endpoint with an event and coord
 
 TileSpec:
-  tile name, TileImpl, tile_num, reads, writes, waits, notifies, attrs
+  tile name, TileImpl, grid, reads, writes, waits, notifies, attrs
 
 TileImpl:
   local implementation for one tile kind
@@ -138,22 +138,22 @@ stage1 = (
     kernel.tile(
         "stage1_partial_reduce",
         Stage1ReduceTile(),
-        tile_num=(NUM_BLOCK_M, NUM_BLOCK_N, 1),
+        grid=(NUM_BLOCK_M, NUM_BLOCK_N, 1),
     )
     .read(A)
     .write(B)
-    .notify(row_ready, coord_map=lambda m, n, k: (m,))
+    .notify(row_ready, coord=lambda m, n, k: (m,))
 )
 
 stage2 = (
     kernel.tile(
         "stage2_final_reduce",
         Stage2ReduceTile(),
-        tile_num=(NUM_BLOCK_M, 1, 1),
+        grid=(NUM_BLOCK_M, 1, 1),
     )
     .read(B)
     .write(C)
-    .wait(row_ready, coord_map=lambda m, n, k: (m,))
+    .wait(row_ready, coord=lambda m, n, k: (m,))
 )
 ```
 
@@ -185,10 +185,10 @@ attached implementations.
 Validation should check at least:
 
 ```text
-1. tile_num uses the canonical (m, n, k) convention
+1. grid uses the canonical (m, n, k) convention
 2. all tensors referenced by tiles are registered in the KernelSpec
 3. all events referenced by waits/notifies are registered in the KernelSpec
-4. event coord_map rank is compatible with the event shape when statically known
+4. event coord rank is compatible with the event shape when statically known
 5. producer/consumer tensor flow is complete enough for lowering
 6. required TileImpl hooks and signatures are compatible with the selected lowering
 ```

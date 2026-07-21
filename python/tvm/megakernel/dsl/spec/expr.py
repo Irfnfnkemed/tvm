@@ -26,14 +26,14 @@ from typing import Any
 class VarSpec:
     """Symbolic variable used in shapes, tile counts, and event counts.
 
-    ``range`` is an optional inclusive ``(min, max)`` bound.  Lowering uses
+    ``bounds`` is an optional inclusive ``(min, max)`` bound.  Lowering uses
     the upper bound when a symbolic shape must reserve static storage, such
     as event workspace layout.
     """
 
     name: str
     dtype: str = "int32"
-    range: tuple[int, int] | None = None
+    bounds: tuple[int, int] | None = None
 
     def __add__(self, other):
         return _binary_expr("add", self, other)
@@ -192,11 +192,11 @@ def expr_bounds(value: Any, require_bounded: bool = True) -> tuple[int, int] | N
     if isinstance(value, int) and not isinstance(value, bool):
         return (value, value)
     if isinstance(value, VarSpec):
-        if value.range is None:
+        if value.bounds is None:
             if require_bounded:
-                raise ValueError(f"symbolic VarSpec({value.name!r}) without a range")
+                raise ValueError(f"symbolic VarSpec({value.name!r}) without bounds")
             return None
-        return value.range
+        return value.bounds
     if not isinstance(value, ExprSpec):
         if require_bounded:
             raise TypeError(f"expression must be an int, VarSpec, or ExprSpec, got {value!r}")
@@ -218,13 +218,13 @@ def _expr_bounds_op(op: str, bounds: list[tuple[int, int]]) -> tuple[int, int]:
     if op == "floordiv":
         lo_rhs, hi_rhs = bounds[1]
         if lo_rhs <= 0 <= hi_rhs:
-            raise ValueError("floordiv expression divisor range must not include zero")
+            raise ValueError("floordiv expression divisor bounds must not include zero")
         values = [a // b for a in bounds[0] for b in bounds[1]]
         return (min(values), max(values))
     if op == "mod":
         lo_rhs, hi_rhs = bounds[1]
         if lo_rhs <= 0 <= hi_rhs:
-            raise ValueError("mod expression divisor range must not include zero")
+            raise ValueError("mod expression divisor bounds must not include zero")
         max_abs = max(abs(lo_rhs), abs(hi_rhs))
         return (0, max_abs - 1)
     if op == "neg":
@@ -232,7 +232,7 @@ def _expr_bounds_op(op: str, bounds: list[tuple[int, int]]) -> tuple[int, int]:
     if op == "ceildiv":
         lo_rhs, hi_rhs = bounds[1]
         if lo_rhs <= 0 <= hi_rhs:
-            raise ValueError("ceildiv expression divisor range must not include zero")
+            raise ValueError("ceildiv expression divisor bounds must not include zero")
         values = [(a + b - 1) // b for a in bounds[0] for b in bounds[1]]
         return (min(values), max(values))
     raise ValueError(f"unsupported ExprSpec op {op!r}")

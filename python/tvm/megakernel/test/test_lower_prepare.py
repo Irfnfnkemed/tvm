@@ -69,8 +69,8 @@ def _lowering_plan():
 
 def test_lower_prepare_uses_var_range_upper_bound_for_event_layout():
     kernel = KernelSpec("plan_symbolic_event")
-    rows = kernel.var("rows", range=(1, 4))
-    groups = kernel.var("groups", range=(2, 8))
+    rows = kernel.var("rows", bounds=(1, 4))
+    groups = kernel.var("groups", bounds=(2, 8))
     tensor = kernel.tensor("x", (rows, groups), "float32")
     ready = kernel.event("ready", (rows, groups), init_count=1)
     done = kernel.event("done", (rows,), init_count=1)
@@ -109,13 +109,13 @@ def test_lower_prepare_rejects_unbounded_var_in_event_shape():
     )
 
     semantic = validate_semantic_plan(build_semantic_plan(kernel))
-    with pytest.raises(ValueError, match="without a range"):
+    with pytest.raises(ValueError, match="without bounds"):
         prepare_static_lowering_plan(semantic, LoweringOptions(attrs={"sm_count": 2}))
 
 
 def test_lower_prepare_uses_var_expression_upper_bound_for_event_layout():
     kernel = KernelSpec("plan_expr_event")
-    rows = kernel.var("rows", range=(1, 9))
+    rows = kernel.var("rows", bounds=(1, 9))
     blocks = rows.ceildiv(4)
     tensor = kernel.tensor("x", (rows + 1,), "float32")
     ready = kernel.event("ready", (blocks,), init_count=1)
@@ -151,7 +151,7 @@ def test_lower_prepare_rejects_unbounded_var_expression_in_event_shape():
     )
 
     semantic = validate_semantic_plan(build_semantic_plan(kernel))
-    with pytest.raises(ValueError, match="without a range"):
+    with pytest.raises(ValueError, match="without bounds"):
         prepare_static_lowering_plan(semantic, LoweringOptions(attrs={"sm_count": 2}))
 
 

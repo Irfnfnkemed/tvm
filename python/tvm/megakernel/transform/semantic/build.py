@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ...dsl import EventSpec, KernelSpec, VarSpec, expr_vars
+from ...dsl.spec import EventSpec, KernelSpec, VarSpec, expr_vars
 from .model import LogicalEdge, SemanticPlan
 
 
@@ -76,14 +76,19 @@ def _collect_kernel_vars(kernel: KernelSpec) -> list[VarSpec]:
     for event in kernel.events.values():
         add_from(event.shape)
     for tile in kernel.tiles:
-        add_from(tile.tile_num)
+        add_from(tile.grid)
     return result
 
 
 def event_init_count(event: EventSpec, coord: tuple[int, ...]) -> int:
     """Evaluate one logical event init count in semantic validation."""
 
-    return event.init_count(coord) if callable(event.init_count) else event.init_count
+    count = event.init_count(*coord)
+    if isinstance(count, bool) or not isinstance(count, int):
+        raise TypeError("event init_count must produce an integer")
+    if count < 0:
+        raise ValueError("event init_count must produce a non-negative integer")
+    return count
 
 
 __all__ = ["build_semantic_plan", "event_init_count", "logical_edges"]

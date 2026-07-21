@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from ...dsl import EventSpec, KernelSpec, TensorSpec, TileSpec, VarSpec
+from ...dsl.spec import EventSpec, KernelSpec, TensorSpec, TileSpec, VarSpec
 
 
 @dataclass(frozen=True)

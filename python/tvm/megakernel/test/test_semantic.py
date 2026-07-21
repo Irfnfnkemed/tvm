@@ -134,16 +134,16 @@ def test_semantic_rejects_foreign_wait_event():
 
 
 @pytest.mark.parametrize(
-    "coord_map,error,match",
+    "coord,error,match",
     [
         pytest.param(lambda m, n, k: m, TypeError, "tuple/list", id="not-tuple"),
         pytest.param(lambda m, n, k: (m, n, k), ValueError, "coord rank", id="rank-mismatch"),
         pytest.param(lambda m, n, k: (m, None), TypeError, "unsupported value", id="bad-value"),
     ],
 )
-def test_semantic_rejects_invalid_coord_map_shape(coord_map, error, match):
+def test_semantic_rejects_invalid_coord_shape(coord, error, match):
     kernel, _, ready, producer, _ = _basic_kernel()
-    producer.notifies[0] = DependencySpec(ready, coord_map)
+    producer.notifies[0] = DependencySpec(ready, coord)
 
     with pytest.raises(error, match=match):
         _validate(kernel)
@@ -187,7 +187,7 @@ def test_semantic_rejects_wait_without_matching_notify_coord():
     ready = kernel.event(
         "ready",
         (4, 2),
-        init_count=lambda coord: 1 if coord[1] == 0 else 0,
+        init_count=lambda m, n: 1 if n == 0 else 0,
     )
 
     kernel.tile("producer", EmptyTile(), (4, 1, 1), reads=[_r2_first_col(tensor)]).notify(
@@ -228,7 +228,7 @@ def test_semantic_samples_symbolic_wait_swapped_coords():
 
 def test_semantic_samples_symbolic_range_bounds():
     kernel = KernelSpec("semantic_symbolic_range")
-    rows = kernel.var("rows", range=(20, 24))
+    rows = kernel.var("rows", bounds=(20, 24))
     tensor = kernel.tensor("x", (rows,), "float32")
     ready = kernel.event("ready", (rows,), init_count=1)
 
@@ -243,16 +243,104 @@ def test_semantic_samples_symbolic_range_bounds():
         _validate(kernel)
 
 
-def test_kernel_var_rejects_invalid_range():
+def test_kernel_var_rejects_invalid_bounds():
     kernel = KernelSpec("invalid_var_range")
 
-    with pytest.raises(ValueError, match="range"):
-        kernel.var("rows", range=(8, 1))
+    with pytest.raises(ValueError, match="bounds"):
+        kernel.var("rows", bounds=(8, 1))
 
 
-def test_semantic_accepts_varspec_expression_in_shape_event_and_tile_num():
+def test_kernel_normalizes_tensor_and_event_shape():
+    kernel = KernelSpec("normalize_shape")
+    rows = kernel.var("rows", bounds=(1, 4))
+
+    tensor = kernel.tensor("x", rows, "float32")
+    event = kernel.event("ready", rows, init_count=1)
+
+    assert tensor.shape == (rows,)
+    assert event.shape == (rows,)
+
+
+def test_kernel_rejects_invalid_shape_dim():
+    kernel = KernelSpec("invalid_shape")
+
+    with pytest.raises(TypeError, match="shape dims"):
+        kernel.tensor("x", (True,), "float32")
+    with pytest.raises(TypeError, match="shape dims"):
+        kernel.event("ready", (object(),), init_count=1)
+
+
+def test_kernel_normalizes_event_init_count_to_callable():
+    kernel = KernelSpec("event_init_count_callable")
+
+    events = [kernel.event(f"ready_{count}", (2,), init_count=count) for count in (0, 3)]
+    dynamic = kernel.event("dynamic", (2, 3), init_count=lambda m, n: m + n)
+
+    assert events[0].init_count(0) == 0
+    assert events[1].init_count(0) == 3
+    assert dynamic.init_count(1, 2) == 3
+
+
+def test_kernel_rejects_invalid_event_init_count():
+    kernel = KernelSpec("invalid_event_init_count")
+
+    for value in (True, -1):
+        with pytest.raises((TypeError, ValueError), match="init_count"):
+            kernel.event(f"ready_{value}", (1,), init_count=value)
+    with pytest.raises(TypeError, match="init_count"):
+        kernel.event("ready_bad", (1,), init_count="x")
+
+
+def test_kernel_normalizes_tile_grid():
+    kernel = KernelSpec("normalize_grid")
+    tensor = kernel.tensor("x", (1,), "float32")
+
+    tile = kernel.tile("only", EmptyTile(), [1, 1, 1], reads=[tensor])
+
+    assert tile.grid == (1, 1, 1)
+
+
+def test_kernel_rejects_invalid_tile_grid_and_impl():
+    kernel = KernelSpec("invalid_grid")
+    tensor = kernel.tensor("x", (1,), "float32")
+
+    with pytest.raises(TypeError, match="TileImpl"):
+        kernel.tile("bad_impl", object(), (1, 1, 1), reads=[tensor])
+    with pytest.raises(ValueError, match="three dimensions"):
+        kernel.tile("bad_rank", EmptyTile(), (1, 1), reads=[tensor])
+    with pytest.raises(TypeError, match="grid dims"):
+        kernel.tile("bad_dim", EmptyTile(), (1, True, 1), reads=[tensor])
+
+
+def test_tile_wait_notify_normalizes_constant_coord():
+    kernel = KernelSpec("normalize_coord")
+    event = kernel.event("ready", (1,), init_count=1)
+    tensor = kernel.tensor("x", (1,), "float32")
+
+    tile = kernel.tile("only", EmptyTile(), (1, 1, 1), reads=[tensor])
+    tile.wait(event, [0], inverse_coord=[0, 0, 0]).notify(event, [0])
+
+    assert tile.waits[0].coord == (0,)
+    assert tile.waits[0].inverse_coord == (0, 0, 0)
+    assert tile.notifies[0].coord == (0,)
+
+
+def test_tile_wait_notify_rejects_invalid_coord():
+    kernel = KernelSpec("invalid_coord")
+    event = kernel.event("ready", (1,), init_count=1)
+    tile = kernel.tile("only", EmptyTile(), (1, 1, 1))
+
+    with pytest.raises(TypeError, match="coord"):
+        tile.wait(event, 0)
+    with pytest.raises(TypeError, match="inverse_coord"):
+        tile.wait(event, (0,), inverse_coord=0)
+    with pytest.raises(TypeError, match="coord"):
+        tile.notify(event, 0)
+
+
+def test_semantic_accepts_varspec_expression_in_shape_event_and_grid():
     kernel = KernelSpec("semantic_expr_shape")
-    rows = kernel.var("rows", range=(1, 9))
+    rows = kernel.var("rows", bounds=(1, 9))
     blocks = rows.ceildiv(4)
     tensor = kernel.tensor("x", (rows + 1,), "float32")
     ready = kernel.event("ready", (blocks,), init_count=1)
@@ -271,8 +359,8 @@ def test_semantic_accepts_varspec_expression_in_shape_event_and_tile_num():
 
 def test_semantic_rejects_foreign_varspec_inside_expression():
     kernel = KernelSpec("semantic_expr_foreign_var")
-    rows = kernel.var("rows", range=(1, 4))
-    foreign = KernelSpec("foreign").var("foreign", range=(1, 4))
+    rows = kernel.var("rows", bounds=(1, 4))
+    foreign = KernelSpec("foreign").var("foreign", bounds=(1, 4))
 
     kernel.tensor("x", (rows + foreign,), "float32")
 

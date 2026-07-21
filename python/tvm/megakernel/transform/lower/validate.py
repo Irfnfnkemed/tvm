@@ -110,7 +110,7 @@ def _validate_static_schedule(plan: LoweringPlan) -> None:
     sm_count = plan.options.attrs.get("sm_count", 1)
     total_tasks = 0
     for phase in plan.static_schedule.phases:
-        count = raw_shape_product(phase.tile_num)
+        count = raw_shape_product(phase.grid)
         if count is None:
             return
         total_tasks += count
@@ -139,29 +139,29 @@ def _validate_dynamic_schedule(plan: LoweringPlan) -> None:
     endpoints = [tile_plan for tile_plan in plan.tile_plans if not tile_plan.notifies]
     if len(endpoints) != 1:
         raise ValueError("dynamic schedule currently requires exactly one endpoint tile")
-    endpoint_count = raw_shape_product(endpoints[0].tile_num)
+    endpoint_count = raw_shape_product(endpoints[0].grid)
     if endpoint_count != 1:
-        raise ValueError("dynamic schedule currently requires the endpoint tile_num product to be 1")
+        raise ValueError("dynamic schedule currently requires the endpoint grid product to be 1")
 
     for tile_plan in plan.tile_plans:
         for dependency in tile_plan.notifies:
             event = dependency.event
-            coord_map = dependency.coord_from_tile
-            _validate_coord_map_rank(coord_map, len(_shape_tuple(event.shape)), "notify")
+            coord = dependency.coord
+            _validate_coord_rank(coord, len(_shape_tuple(event.shape)), "notify")
         for dependency in tile_plan.waits:
             event = dependency.event
-            coord_map = dependency.coord_from_tile
-            inverse_coord_map = dependency.inverse_coord_from_event
-            _validate_coord_map_rank(coord_map, len(_shape_tuple(event.shape)), "wait")
-            if inverse_coord_map is None:
+            coord = dependency.coord
+            inverse_coord = dependency.inverse_coord
+            _validate_coord_rank(coord, len(_shape_tuple(event.shape)), "wait")
+            if inverse_coord is None:
                 raise ValueError(
-                    "dynamic schedule requires inverse_coord_from_event for every wait"
+                    "dynamic schedule requires inverse_coord for every wait"
                 )
-            _validate_inverse_coord_map(coord_map, inverse_coord_map, len(_shape_tuple(event.shape)))
+            _validate_inverse_coord(coord, inverse_coord, len(_shape_tuple(event.shape)))
 
     entry_tasks = 0
     for phase in plan.dynamic_schedule.entry_phases:
-        count = raw_shape_product(phase.tile_num)
+        count = raw_shape_product(phase.grid)
         if count is None:
             return
         entry_tasks += count
@@ -173,21 +173,21 @@ def _shape_tuple(shape):
     return tuple(shape) if isinstance(shape, (tuple, list)) else (shape,)
 
 
-def _validate_coord_map_rank(coord_map, rank: int, label: str) -> None:
+def _validate_coord_rank(coord_fn, rank: int, label: str) -> None:
     sample = (101, 203, 307)
-    coord = coord_map(*sample) if callable(coord_map) else coord_map
+    coord = coord_fn(*sample) if callable(coord_fn) else coord_fn
     if not isinstance(coord, (tuple, list)) or len(coord) != rank:
-        raise ValueError(f"dynamic schedule {label} coord map rank must match event rank")
+        raise ValueError(f"dynamic schedule {label} coord rank must match event rank")
 
 
-def _validate_inverse_coord_map(coord_map, inverse_coord_map, rank: int) -> None:
+def _validate_inverse_coord(coord_fn, inverse_coord, rank: int) -> None:
     event_coord = tuple((101, 203, 307)[:rank])
-    consumer_idx = inverse_coord_map(*event_coord) if callable(inverse_coord_map) else inverse_coord_map
+    consumer_idx = inverse_coord(*event_coord) if callable(inverse_coord) else inverse_coord
     if not isinstance(consumer_idx, (tuple, list)) or len(consumer_idx) != 3:
-        raise ValueError("dynamic schedule inverse_coord_from_event must return a 3D tile index")
-    roundtrip = coord_map(*consumer_idx) if callable(coord_map) else coord_map
+        raise ValueError("dynamic schedule inverse_coord must return a 3D tile index")
+    roundtrip = coord_fn(*consumer_idx) if callable(coord_fn) else coord_fn
     if not isinstance(roundtrip, (tuple, list)) or tuple(roundtrip) != event_coord:
-        raise ValueError("dynamic schedule inverse_coord_from_event must round-trip through wait coord_map")
+        raise ValueError("dynamic schedule inverse_coord must round-trip through wait coord")
 
 
 validate_static_lowering_plan = validate_lowering_plan

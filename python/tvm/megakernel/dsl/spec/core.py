@@ -27,52 +27,13 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from .expr import ExprLike, ExprSpec, VarSpec, eval_expr_like, expr_bounds, expr_vars
-from .impl import TileImpl
+from .region import R, RegionRange, RegionSpec, TileRegionMap, TileRegionResult
+from ..impl import TileImpl
 
 
 ShapeType = ExprLike | tuple[ExprLike, ...] | list[ExprLike]
 CoordMapType = Callable[[int, int, int], tuple[int, ...]] | tuple[int, ...] | list[int]
-TileNumType = tuple[ExprLike, ExprLike, ExprLike] | list[ExprLike]
-
-
-@dataclass(frozen=True)
-class RegionRange:
-    """One BufferRegion-style dimension: half-open ``[start, start + extent)``."""
-
-    start: Any
-    extent: Any
-
-
-@dataclass(frozen=True)
-class RegionSpec:
-    """Logical tensor region, normalized to BufferRegion-style ranges."""
-
-    dims: tuple[RegionRange, ...]
-
-
-class RegionBuilder:
-    """Builder used as ``R[i, j:j+8]`` in tensor region lambdas."""
-
-    def __getitem__(self, indices):
-        if not isinstance(indices, tuple):
-            indices = (indices,)
-        dims = []
-        for index in indices:
-            if isinstance(index, slice):
-                if index.step is not None:
-                    raise ValueError("region slices do not support step")
-                if index.stop is None:
-                    raise ValueError("region slices require a stop")
-                start = 0 if index.start is None else index.start
-                dims.append(RegionRange(start=start, extent=index.stop - start))
-            else:
-                dims.append(RegionRange(start=index, extent=1))
-        return RegionSpec(dims=tuple(dims))
-
-
-R = RegionBuilder()
-TileRegionResult = RegionSpec | tuple[Any, ...] | list[Any]
-TileRegionMap = Callable[[Any, Any, Any], TileRegionResult] | TileRegionResult
+GridType = tuple[ExprLike, ExprLike, ExprLike] | list[ExprLike]
 
 
 @dataclass(frozen=True)
@@ -86,7 +47,7 @@ class TensorSpec:
     """
 
     name: str
-    shape: ShapeType
+    shape: tuple[ExprLike, ...]
     dtype: str
     region_from_tile: TileRegionMap | None = field(default=None, compare=False)
     base: "TensorSpec | None" = field(default=None, compare=False)
@@ -115,19 +76,24 @@ class EventSpec:
     """Logical readiness event."""
 
     name: str
-    shape: ShapeType
-    init_count: int | Callable[[tuple[int, ...]], int]
+    shape: tuple[ExprLike, ...]
+    init_count: Callable[..., int]
     dtype: str = "int32"
     attrs: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
 class DependencySpec:
-    """Internal event dependency attached to a tile wait or notify."""
+    """Internal event dependency attached to a tile wait or notify.
+
+    ``coord`` maps the tile index ``(m, n, k)`` to the event coordinate.
+    ``inverse_coord`` maps an event coordinate back to a consumer tile index
+    for dynamic scheduling.
+    """
 
     event: EventSpec
-    coord_from_tile: CoordMapType
-    inverse_coord_from_event: CoordMapType | None = None
+    coord: CoordMapType
+    inverse_coord: CoordMapType | None = None
 
 
 @dataclass
@@ -136,7 +102,7 @@ class TileSpec:
 
     name: str
     impl: TileImpl
-    tile_num: TileNumType
+    grid: tuple[ExprLike, ExprLike, ExprLike]
     reads: list[TensorSpec] = field(default_factory=list)
     writes: list[TensorSpec] = field(default_factory=list)
     waits: list[DependencySpec] = field(default_factory=list)
@@ -146,24 +112,41 @@ class TileSpec:
     def wait(
         self,
         event: EventSpec,
-        coord_from_tile: CoordMapType,
-        inverse_coord_from_event: CoordMapType | None = None,
+        coord: CoordMapType,
+        inverse_coord: CoordMapType | None = None,
     ):
-        """Declare that this tile waits on ``event`` at ``coord_from_tile``."""
+        """Declare an event wait.
+
+        ``coord`` maps tile index ``(m, n, k)`` to the event coordinate.
+        ``inverse_coord`` maps event coordinate back to the consumer tile
+        index and is required by dynamic scheduling.
+        """
 
         self.waits.append(
             DependencySpec(
                 event=event,
-                coord_from_tile=coord_from_tile,
-                inverse_coord_from_event=inverse_coord_from_event,
+                coord=_normalize_coord(coord, f"tile {self.name!r}.wait coord"),
+                inverse_coord=(
+                    None
+                    if inverse_coord is None
+                    else _normalize_coord(inverse_coord, f"tile {self.name!r}.wait inverse_coord")
+                ),
             )
         )
         return self
 
-    def notify(self, event: EventSpec, coord_from_tile: CoordMapType):
-        """Declare that this tile notifies ``event`` at ``coord_from_tile``."""
+    def notify(self, event: EventSpec, coord: CoordMapType):
+        """Declare an event notify.
 
-        self.notifies.append(DependencySpec(event=event, coord_from_tile=coord_from_tile))
+        ``coord`` maps tile index ``(m, n, k)`` to the event coordinate.
+        """
+
+        self.notifies.append(
+            DependencySpec(
+                event=event,
+                coord=_normalize_coord(coord, f"tile {self.name!r}.notify coord"),
+            )
+        )
         return self
 
 
@@ -182,22 +165,22 @@ class KernelSpec:
         self,
         name: str,
         dtype: str = "int32",
-        range: tuple[int, int] | None = None,
+        bounds: tuple[int, int] | None = None,
     ):
         """Register a symbolic integer variable."""
 
         if name in self.vars:
             raise ValueError(f"Duplicate var: {name}")
-        if range is not None:
+        if bounds is not None:
             if (
-                not isinstance(range, tuple)
-                or len(range) != 2
-                or any(not isinstance(value, int) or isinstance(value, bool) for value in range)
+                not isinstance(bounds, tuple)
+                or len(bounds) != 2
+                or any(not isinstance(value, int) or isinstance(value, bool) for value in bounds)
             ):
-                raise TypeError("var range must be a tuple of two integers")
-            if range[0] <= 0 or range[1] <= 0 or range[0] > range[1]:
-                raise ValueError("var range must satisfy 0 < min <= max")
-        var = VarSpec(name=name, dtype=dtype, range=range)
+                raise TypeError("var bounds must be a tuple of two integers")
+            if bounds[0] <= 0 or bounds[1] <= 0 or bounds[0] > bounds[1]:
+                raise ValueError("var bounds must satisfy 0 < min <= max")
+        var = VarSpec(name=name, dtype=dtype, bounds=bounds)
         self.vars[name] = var
         return var
 
@@ -206,7 +189,9 @@ class KernelSpec:
 
         if name in self.tensors:
             raise ValueError(f"Duplicate tensor: {name}")
-        tensor = TensorSpec(name=name, shape=shape, dtype=dtype)
+        tensor = TensorSpec(
+            name=name, shape=_normalize_shape(shape, f"tensor {name!r}"), dtype=dtype
+        )
         self.tensors[name] = tensor
         return tensor
 
@@ -214,7 +199,7 @@ class KernelSpec:
         self,
         name: str,
         shape: ShapeType,
-        init_count: int | Callable[[tuple[int, ...]], int],
+        init_count: int | Callable[..., int],
         dtype: str = "int32",
         attrs: dict[str, Any] | None = None,
     ):
@@ -222,12 +207,10 @@ class KernelSpec:
 
         if name in self.events:
             raise ValueError(f"Duplicate event: {name}")
-        if init_count is None:
-            raise ValueError("event init_count must be specified")
         event = EventSpec(
             name=name,
-            shape=shape,
-            init_count=init_count,
+            shape=_normalize_shape(shape, f"event {name!r}"),
+            init_count=_normalize_event_init_count(init_count),
             dtype=dtype,
             attrs=attrs or {},
         )
@@ -238,7 +221,7 @@ class KernelSpec:
         self,
         name: str,
         impl: TileImpl,
-        tile_num: TileNumType,
+        grid: GridType,
         reads: list[TensorSpec] | None = None,
         writes: list[TensorSpec] | None = None,
         attrs: dict[str, Any] | None = None,
@@ -247,12 +230,14 @@ class KernelSpec:
 
         if any(tile.name == name for tile in self.tiles):
             raise ValueError(f"Duplicate tile: {name}")
+        if not isinstance(impl, TileImpl):
+            raise TypeError("tile impl must be a TileImpl")
         read_tensors = _normalize_accesses(reads or [], "reads")
         write_tensors = _normalize_accesses(writes or [], "writes")
         tile = TileSpec(
             name=name,
             impl=impl,
-            tile_num=tile_num,
+            grid=_normalize_grid(grid, f"tile {name!r} grid"),
             reads=read_tensors,
             writes=write_tensors,
             attrs=attrs or {},
@@ -261,7 +246,11 @@ class KernelSpec:
         return tile
 
     def validate(self):
-        raise NotImplementedError("Validation is not yet implemented.")
+        """Build and validate the DSL semantic plan for this kernel."""
+
+        from tvm.megakernel.transform.semantic import build_semantic_plan, validate_semantic_plan
+
+        return validate_semantic_plan(build_semantic_plan(self))
 
     def lower(self, options=None):
         from tvm.megakernel.transform import lower_to_tirx
@@ -276,3 +265,47 @@ def _normalize_accesses(accesses: list[TensorSpec], label: str) -> list[TensorSp
             raise TypeError(f"tile {label} entries must be TensorSpec, got {access!r}")
         tensors.append(access)
     return tensors
+
+
+def _normalize_shape(shape: ShapeType, label: str) -> tuple[ExprLike, ...]:
+    values = tuple(shape) if isinstance(shape, (tuple, list)) else (shape,)
+    for dim in values:
+        if isinstance(dim, bool) or not isinstance(dim, (int, VarSpec, ExprSpec)):
+            raise TypeError(f"{label} shape dims must be int, VarSpec, or ExprSpec")
+    return values
+
+
+def _normalize_coord(coord: CoordMapType, label: str) -> CoordMapType:
+    if callable(coord):
+        return coord
+    if isinstance(coord, (tuple, list)):
+        return tuple(coord)
+    raise TypeError(f"{label} must be callable or tuple/list")
+
+
+def _normalize_grid(grid: GridType, label: str) -> tuple[ExprLike, ExprLike, ExprLike]:
+    if not isinstance(grid, (tuple, list)):
+        raise TypeError(f"{label} must be a tuple/list of three dimensions")
+    values = tuple(grid)
+    if len(values) != 3:
+        raise ValueError(f"{label} must have exactly three dimensions")
+    for dim in values:
+        if isinstance(dim, bool) or not isinstance(dim, (int, VarSpec, ExprSpec)):
+            raise TypeError(f"{label} dims must be int, VarSpec, or ExprSpec")
+    return values
+
+
+def _normalize_event_init_count(init_count: int | Callable[..., int]) -> Callable[..., int]:
+    if isinstance(init_count, bool):
+        raise TypeError("event init_count must be an int or callable")
+    if isinstance(init_count, int):
+        if init_count < 0:
+            raise ValueError("event init_count must be non-negative")
+
+        def uniform_init_count(*_coord, value=init_count):
+            return value
+
+        return uniform_init_count
+    if callable(init_count):
+        return init_count
+    raise TypeError("event init_count must be an int or callable")

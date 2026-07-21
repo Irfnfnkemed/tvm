@@ -26,7 +26,7 @@ import random
 from typing import Any
 import warnings
 
-from ...dsl import EventSpec, ExprSpec, RegionRange, RegionSpec, TensorSpec, VarSpec, eval_expr_like, expr_vars
+from ...dsl.spec import EventSpec, ExprSpec, RegionRange, RegionSpec, TensorSpec, VarSpec, eval_expr_like, expr_vars
 from .build import event_init_count
 from .impl_access import collect_impl_access
 from .model import SemanticPlan
@@ -54,7 +54,7 @@ def validate_semantic_plan(plan: SemanticPlan) -> SemanticPlan:
         notified_events: set[int] = set()
         for dependency in tile.notifies:
             event = dependency.event
-            coord_map = dependency.coord_from_tile
+            coord = dependency.coord
             if id(event) not in event_ids:
                 raise ValueError(f"tile {tile.name!r} notifies event outside kernel")
             if id(event) in notified_events:
@@ -62,13 +62,13 @@ def validate_semantic_plan(plan: SemanticPlan) -> SemanticPlan:
                     f"tile {tile.name!r} notifies event {event.name!r} more than once"
                 )
             notified_events.add(id(event))
-            _validate_coord_map_shape(event, coord_map, tile.tile_num, f"{tile.name}.notify", var_ids)
+            _validate_coord_shape(event, coord, tile.grid, f"{tile.name}.notify", var_ids)
             if tile not in producers[id(event)]:
                 producers[id(event)].append(tile)
         waited_events: set[int] = set()
         for dependency in tile.waits:
             event = dependency.event
-            coord_map = dependency.coord_from_tile
+            coord = dependency.coord
             if id(event) not in event_ids:
                 raise ValueError(f"tile {tile.name!r} waits on event outside kernel")
             if id(event) in waited_events:
@@ -76,7 +76,7 @@ def validate_semantic_plan(plan: SemanticPlan) -> SemanticPlan:
                     f"tile {tile.name!r} waits on event {event.name!r} more than once"
                 )
             waited_events.add(id(event))
-            _validate_coord_map_shape(event, coord_map, tile.tile_num, f"{tile.name}.wait", var_ids)
+            _validate_coord_shape(event, coord, tile.grid, f"{tile.name}.wait", var_ids)
             if tile not in consumers[id(event)]:
                 consumers[id(event)].append(tile)
 
@@ -166,7 +166,7 @@ def _validate_actual_accesses(tile, actual_accesses, declared_accesses, kind: st
             )
             continue
         for env in envs:
-            tile_extents = _static_int_tuple(tile.tile_num, env)
+            tile_extents = _static_int_tuple(tile.grid, env)
             if tile_extents is None:
                 continue
             for idx in product(*(range(extent) for extent in tile_extents)):
@@ -192,7 +192,7 @@ def _validate_kernel_expr_ownership(plan: SemanticPlan, var_ids: set[int]) -> No
     for event in plan.events:
         _validate_expr_ownership(event.shape, var_ids, f"event {event.name!r} shape")
     for tile in plan.tiles:
-        _validate_expr_ownership(tile.tile_num, var_ids, f"tile {tile.name!r} tile_num")
+        _validate_expr_ownership(tile.grid, var_ids, f"tile {tile.name!r} grid")
 
 
 def _validate_expr_ownership(value: Any, var_ids: set[int], label: str) -> None:
@@ -248,7 +248,7 @@ def _validate_region_dependency_coords(plan: SemanticPlan) -> None:
     envs = _sample_plan_envs(plan)
     for env in envs:
         for producer in plan.tiles:
-            producer_extents = _static_int_tuple(producer.tile_num, env)
+            producer_extents = _static_int_tuple(producer.grid, env)
             if producer_extents is None:
                 continue
             producer_writes = list(producer.writes)
@@ -257,7 +257,7 @@ def _validate_region_dependency_coords(plan: SemanticPlan) -> None:
             for consumer in plan.tiles:
                 if consumer is producer:
                     continue
-                consumer_extents = _static_int_tuple(consumer.tile_num, env)
+                consumer_extents = _static_int_tuple(consumer.grid, env)
                 if consumer_extents is None:
                     continue
                 consumer_reads = list(consumer.reads)
@@ -299,7 +299,7 @@ def _validate_waited_region_sources(plan: SemanticPlan) -> None:
     envs = _sample_plan_envs(plan)
     for env in envs:
         for consumer in plan.tiles:
-            consumer_extents = _static_int_tuple(consumer.tile_num, env)
+            consumer_extents = _static_int_tuple(consumer.grid, env)
             if consumer_extents is None:
                 continue
             consumer_reads = list(consumer.reads)
@@ -317,7 +317,7 @@ def _validate_waited_region_sources(plan: SemanticPlan) -> None:
                     )
                     for dependency in consumer.waits:
                         wait_event = dependency.event
-                        wait_map = dependency.coord_from_tile
+                        wait_map = dependency.coord
                         wait_coord = _resolve_coord(_coord_from_map(wait_map, *consumer_idx), env)
                         _validate_waited_region_source(
                             plan, consumer, consumer_idx, tensor, read_region,
@@ -345,7 +345,7 @@ def _validate_waited_region_source(
         if not any(dep.event is wait_event for dep in producer.notifies):
             continue
         has_same_tensor_event_writer = True
-        producer_extents = _static_int_tuple(producer.tile_num, env)
+        producer_extents = _static_int_tuple(producer.grid, env)
         if producer_extents is None:
             continue
         for producer_idx in product(*(range(extent) for extent in producer_extents)):
@@ -371,7 +371,7 @@ def _validate_waited_region_source(
 def _producer_notifies_coord(producer, producer_idx, wait_event, wait_coord, env) -> bool:
     for dependency in producer.notifies:
         notify_event = dependency.event
-        notify_map = dependency.coord_from_tile
+        notify_map = dependency.coord
         if notify_event is not wait_event:
             continue
         notify_coord = _resolve_coord(_coord_from_map(notify_map, *producer_idx), env)
@@ -387,11 +387,11 @@ def _base_tensor(access: TensorSpec) -> TensorSpec:
 def _has_matching_event_coord(producer, producer_idx, consumer, consumer_idx, env) -> bool:
     for notify_dep in producer.notifies:
         notify_event = notify_dep.event
-        notify_map = notify_dep.coord_from_tile
+        notify_map = notify_dep.coord
         notify_coord = _resolve_coord(_coord_from_map(notify_map, *producer_idx), env)
         for wait_dep in consumer.waits:
             wait_event = wait_dep.event
-            wait_map = wait_dep.coord_from_tile
+            wait_map = wait_dep.coord
             if wait_event is not notify_event:
                 continue
             wait_coord = _resolve_coord(_coord_from_map(wait_map, *consumer_idx), env)
@@ -428,7 +428,7 @@ def _validate_tensor_region_access(
     if access.region_from_tile is None:
         return
     _validate_region_from_tile_shape(
-        tensor, access.region_from_tile, tile.tile_num, f"{tile.name}.{kind}_region", var_ids
+        tensor, access.region_from_tile, tile.grid, f"{tile.name}.{kind}_region", var_ids
     )
 
 
@@ -462,10 +462,10 @@ def _resolve_region(region: RegionSpec | None, env: dict[VarSpec, int] | None) -
 
 
 def _validate_region_from_tile_shape(
-    tensor: TensorSpec, region_from_tile, tile_num, label: str, var_ids: set[int] | None = None
+    tensor: TensorSpec, region_from_tile, grid, label: str, var_ids: set[int] | None = None
 ) -> None:
     rank = len(_shape_tuple(tensor.shape))
-    tile_extents = _static_int_tuple(tile_num)
+    tile_extents = _static_int_tuple(grid)
     sample = (0, 0, 0)
     if tile_extents is not None:
         sample = tuple(0 for _ in tile_extents)
@@ -555,7 +555,7 @@ def _plan_sample_fits_budget(plan: SemanticPlan, env: dict[VarSpec, int]) -> boo
     for event in plan.events:
         total += _extent_product(_static_int_tuple(event.shape, env))
     for tile in plan.tiles:
-        total += _extent_product(_static_int_tuple(tile.tile_num, env))
+        total += _extent_product(_static_int_tuple(tile.grid, env))
     return total <= budget
 
 
@@ -573,22 +573,22 @@ def _static_int_tuple(values: Any, env: dict[VarSpec, int] | None = None) -> tup
     return tuple(result)
 
 
-def _coord_from_map(coord_map, m_idx, n_idx, k_idx) -> tuple[Any, ...]:
-    coord = coord_map(m_idx, n_idx, k_idx) if callable(coord_map) else coord_map
-    if not isinstance(coord, (tuple, list)):
-        raise TypeError(f"coord_map must return tuple/list, got {coord!r}")
-    return tuple(coord)
+def _coord_from_map(coord_fn, m_idx, n_idx, k_idx) -> tuple[Any, ...]:
+    mapped_coord = coord_fn(m_idx, n_idx, k_idx) if callable(coord_fn) else coord_fn
+    if not isinstance(mapped_coord, (tuple, list)):
+        raise TypeError(f"coord must return tuple/list, got {mapped_coord!r}")
+    return tuple(mapped_coord)
 
 
-def _validate_coord_map_shape(
-    event: EventSpec, coord_map, tile_num, label: str, var_ids: set[int] | None = None
+def _validate_coord_shape(
+    event: EventSpec, coord, grid, label: str, var_ids: set[int] | None = None
 ) -> None:
     rank = len(_shape_tuple(event.shape))
-    tile_extents = _static_int_tuple(tile_num)
+    tile_extents = _static_int_tuple(grid)
     sample = (0, 0, 0)
     if tile_extents is not None:
         sample = tuple(0 for _ in tile_extents)
-    coord = _coord_from_map(coord_map, *sample)
+    coord = _coord_from_map(coord, *sample)
     if len(coord) != rank:
         raise ValueError(
             f"{label} coord rank {len(coord)} does not match event {event.name!r} rank {rank}"
@@ -603,8 +603,8 @@ def _validate_coord_map_shape(
 def _validate_static_event_counts(event: EventSpec, producers, consumers) -> None:
     exact_envs = [None]
     if _static_int_tuple(event.shape) is None or any(
-        _static_int_tuple(producer.tile_num) is None for producer in producers
-    ) or any(_static_int_tuple(consumer.tile_num) is None for consumer in consumers):
+        _static_int_tuple(producer.grid) is None for producer in producers
+    ) or any(_static_int_tuple(consumer.grid) is None for consumer in consumers):
         exact_envs = _sample_var_envs(event, producers, consumers)
     for env in exact_envs:
         event_shape = _static_int_tuple(event.shape, env)
@@ -618,16 +618,16 @@ def _validate_event_counts_for_shape(
 ) -> None:
     notify_counts: dict[tuple[int, ...], int] = defaultdict(int)
     for producer in producers:
-        tile_extents = _static_int_tuple(producer.tile_num, env)
+        tile_extents = _static_int_tuple(producer.grid, env)
         if tile_extents is None:
             return
         for idx in product(*(range(extent) for extent in tile_extents)):
             for dependency in producer.notifies:
                 notify_event = dependency.event
-                coord_map = dependency.coord_from_tile
+                coord = dependency.coord
                 if notify_event is not event:
                     continue
-                coord = _resolve_coord(_coord_from_map(coord_map, *idx), env)
+                coord = _resolve_coord(_coord_from_map(coord, *idx), env)
                 _validate_static_coord(event, coord, event_shape, f"{producer.name}.notify")
                 notify_counts[coord] += 1
 
@@ -641,16 +641,16 @@ def _validate_event_counts_for_shape(
             )
 
     for consumer in consumers:
-        tile_extents = _static_int_tuple(consumer.tile_num, env)
+        tile_extents = _static_int_tuple(consumer.grid, env)
         if tile_extents is None:
             return
         for idx in product(*(range(extent) for extent in tile_extents)):
             for dependency in consumer.waits:
                 wait_event = dependency.event
-                coord_map = dependency.coord_from_tile
+                coord = dependency.coord
                 if wait_event is not event:
                     continue
-                coord = _resolve_coord(_coord_from_map(coord_map, *idx), env)
+                coord = _resolve_coord(_coord_from_map(coord, *idx), env)
                 _validate_static_coord(event, coord, event_shape, f"{consumer.name}.wait")
                 if notify_counts.get(coord, 0) == 0:
                     raise ValueError(
@@ -671,7 +671,7 @@ def _sample_var_envs(event: EventSpec, producers, consumers) -> list[dict[VarSpe
 
     visit(event.shape)
     for tile in (*producers, *consumers):
-        visit(tile.tile_num)
+        visit(tile.grid)
 
     if not vars_seen:
         return []
@@ -700,24 +700,24 @@ def _sample_var_envs(event: EventSpec, producers, consumers) -> list[dict[VarSpe
 
 
 def _sample_value_for_base(var: VarSpec, base: int) -> tuple[VarSpec, int]:
-    if var.range is None:
+    if var.bounds is None:
         return var, base
-    lo, hi = var.range
+    lo, hi = var.bounds
     return var, min(max(base, lo), hi)
 
 
 def _range_sample_values(var: VarSpec) -> tuple[int, ...] | None:
-    if var.range is None:
+    if var.bounds is None:
         return None
-    lo, hi = var.range
+    lo, hi = var.bounds
     mid = (lo + hi) // 2
     return tuple(dict.fromkeys((lo, mid, hi)))
 
 
 def _random_sample_value(var: VarSpec, rng: random.Random) -> int:
-    if var.range is None:
+    if var.bounds is None:
         return rng.randint(1, 16)
-    lo, hi = var.range
+    lo, hi = var.bounds
     return rng.randint(lo, hi)
 
 
@@ -725,7 +725,7 @@ def _sample_fits_budget(event: EventSpec, producers, consumers, env: dict[VarSpe
     budget = 65536
     total = _extent_product(_static_int_tuple(event.shape, env))
     for tile in (*producers, *consumers):
-        total += _extent_product(_static_int_tuple(tile.tile_num, env))
+        total += _extent_product(_static_int_tuple(tile.grid, env))
     return total <= budget
 
 

@@ -15,14 +15,12 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""Megakernel DSL user API."""
+"""Implementation-layer hooks for the megakernel DSL."""
 
-from .impl import SmemManager, TileImpl
-from .spec import KernelSpec, R
+from .core import SmemAllocRecord, SmemManager, TileImpl
 
 __all__ = [
-    "KernelSpec",
-    "R",
+    "SmemAllocRecord",
     "SmemManager",
     "TileImpl",
 ]

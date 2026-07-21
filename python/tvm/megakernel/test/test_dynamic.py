@@ -87,7 +87,7 @@ def _simple_dynamic_kernel():
         (1, 1, 1),
         reads=[tmp.region(lambda m, n, k: R[0:8])],
         writes=[out.region(lambda m, n, k: R[0:8])],
-    ).wait(ready, lambda m, n, k: (m,), inverse_coord_from_event=lambda e: (e, 0, 0))
+    ).wait(ready, lambda m, n, k: (m,), inverse_coord=lambda e: (e, 0, 0))
     return kernel
 
 
@@ -146,16 +146,16 @@ def test_dynamic_rejects_multiple_waits_on_one_tile():
         validate_lowering_plan(plan)
 
 
-def test_dynamic_rejects_non_identity_wait_without_inverse_coord_map():
+def test_dynamic_rejects_non_identity_wait_without_inverse_coord():
     kernel = _simple_dynamic_kernel()
     kernel.tiles[1].waits[0] = DependencySpec(kernel.events["ready"], lambda m, n, k: (n,))
 
     plan = _dynamic_plan(kernel)
-    with pytest.raises(ValueError, match="inverse_coord_from_event"):
+    with pytest.raises(ValueError, match="inverse_coord"):
         validate_lowering_plan(plan)
 
 
-def test_dynamic_uses_inverse_coord_map_to_push_consumer_tile():
+def test_dynamic_uses_inverse_coord_to_push_consumer_tile():
     kernel = KernelSpec("dynamic_inverse")
     tmp = kernel.tensor("tmp", (2, 8), "float32")
     ready = kernel.event("ready", (2,), init_count=1)
@@ -176,10 +176,10 @@ def test_dynamic_uses_inverse_coord_map_to_push_consumer_tile():
     ).wait(
         ready,
         lambda m, n, k: (n,),
-        inverse_coord_from_event=lambda e: (0, e, 0),
+        inverse_coord=lambda e: (0, e, 0),
     ).notify(done, lambda m, n, k: (0,))
     kernel.tile("endpoint", EmptyTile(), (1, 1, 1)).wait(
-        done, lambda m, n, k: (m,), inverse_coord_from_event=lambda e: (e, 0, 0)
+        done, lambda m, n, k: (m,), inverse_coord=lambda e: (e, 0, 0)
     )
 
     plan = _dynamic_plan(kernel)
@@ -187,7 +187,7 @@ def test_dynamic_uses_inverse_coord_map_to_push_consumer_tile():
     trigger = plan.dynamic_schedule.triggers["producer"][0]
 
     assert trigger.consumer.tile.name == "consumer"
-    assert trigger.consumer_inverse_coord_map(1) == (0, 1, 0)
+    assert trigger.consumer_inverse_coord(1) == (0, 1, 0)
     assert _consumer_task_coord_from_event(trigger, (1,)) == (0, 1, 0)
 
     lowered = str(lower_to_tirx_module(kernel, _options()))
