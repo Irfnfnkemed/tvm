@@ -43,10 +43,12 @@ def logical_edges(kernel: KernelSpec) -> tuple[LogicalEdge, ...]:
     producers: dict[int, list] = {id(event): [] for event in kernel.events.values()}
     consumers: dict[int, list] = {id(event): [] for event in kernel.events.values()}
     for tile in kernel.tiles:
-        for event, _ in tile.notifies:
+        for dependency in tile.notifies:
+            event = dependency.event
             if tile not in producers.setdefault(id(event), []):
                 producers[id(event)].append(tile)
-        for event, _ in tile.waits:
+        for dependency in tile.waits:
+            event = dependency.event
             if tile not in consumers.setdefault(id(event), []):
                 consumers[id(event)].append(tile)
 

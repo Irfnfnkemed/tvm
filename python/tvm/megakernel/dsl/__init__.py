@@ -16,24 +16,21 @@
 # under the License.
 """Megakernel DSL building blocks."""
 
+from .expr import ExprLike, ExprSpec, eval_expr_like, expr_bounds, expr_vars, VarSpec
 from .impl import SmemAllocRecord, SmemManager, TileImpl
 from .spec import (
     CoordMapType,
     EventSpec,
-    ExprLike,
-    ExprSpec,
     KernelSpec,
     R,
     RegionRange,
     RegionSpec,
-    eval_expr_like,
-    expr_bounds,
-    expr_vars,
+    TileRegionMap,
+    TileRegionResult,
     ShapeType,
     TensorSpec,
     TileNumType,
     TileSpec,
-    VarSpec,
 )
 
 __all__ = [
@@ -53,6 +50,8 @@ __all__ = [
     "SmemAllocRecord",
     "SmemManager",
     "TileImpl",
+    "TileRegionMap",
+    "TileRegionResult",
     "TileNumType",
     "TileSpec",
     "VarSpec",

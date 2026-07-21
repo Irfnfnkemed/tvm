@@ -25,6 +25,7 @@ import tvm.tirx.script as T
 from tvm.tirx.script import tile as Tx
 
 from tvm.megakernel.dsl import KernelSpec, R, TileImpl
+from tvm.megakernel.dsl.spec import DependencySpec
 from tvm.megakernel.transform import LoweringOptions, MegakernelLowerer, lower_to_tirx_module
 
 
@@ -542,7 +543,7 @@ def test_simple_megakernel():
     assert physical.tile_job_ids == {"sum_a": 0, "sum_b": 1, "merge": 2, "final": 3}
 
     bad_kernel = _build_kernel()
-    bad_kernel.tiles[1].notifies[0] = (
+    bad_kernel.tiles[1].notifies[0] = DependencySpec(
         bad_kernel.events["pair_ready"],
         lambda m, n, k: (m, 0),
     )

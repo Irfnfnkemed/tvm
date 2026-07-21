@@ -1,7 +1,7 @@
 import tvm.tirx.script as T
 from tvm.tirx.script import tile as Tx
 
-from tvm.megakernel.dsl import KernelSpec, TileImpl
+from tvm.megakernel.dsl import KernelSpec, R, TileImpl
 
 
 # Configuration parameters
@@ -33,8 +33,10 @@ class Stage1ReduceTile(TileImpl):
 
         self.A_smem = None
         self.P_smem = None
+        self.smem_manager = None
 
     def _declare_resources(self, smem_manager):
+        self.smem_manager = smem_manager
         self.A_smem = smem_manager.alloc(
             (self.block_m, self.block_n),
             "float32",
@@ -52,6 +54,7 @@ class Stage1ReduceTile(TileImpl):
 
     @T.inline
     def run(self, m_idx, n_idx, k_idx):
+        self.smem_manager.wait_all("cta")
         Tx.copy(
             self.A_smem,
             self.A[
@@ -70,6 +73,8 @@ class Stage1ReduceTile(TileImpl):
             ],
             self.P_smem,
         )
+        self.smem_manager.release_all("cta")
+        self.smem_manager.advance()
 
 
 class Stage2ReduceTile(TileImpl):
@@ -84,8 +89,10 @@ class Stage2ReduceTile(TileImpl):
 
         self.B_smem = None
         self.C_smem = None
+        self.smem_manager = None
 
     def _declare_resources(self, smem_manager):
+        self.smem_manager = smem_manager
         self.B_smem = smem_manager.alloc(
             (self.block_m, self.num_block_n),
             "float32",
@@ -103,6 +110,7 @@ class Stage2ReduceTile(TileImpl):
 
     @T.inline
     def run(self, m_idx, n_idx, k_idx):
+        self.smem_manager.wait_all("cta")
         Tx.copy(
             self.B_smem,
             self.B[
@@ -121,6 +129,8 @@ class Stage2ReduceTile(TileImpl):
             ],
             self.C_smem,
         )
+        self.smem_manager.release_all("cta")
+        self.smem_manager.advance()
 
 
 # ============================================================
@@ -135,7 +145,7 @@ kernel = KernelSpec(
     },
 )
 
-M = kernel.var("M")
+M = kernel.var("M", range=(NUM_BLOCK_M * BLOCK_M, NUM_BLOCK_M * BLOCK_M))
 
 A = kernel.tensor(
     "A",
@@ -173,8 +183,15 @@ stage1 = kernel.tile(
         block_n=BLOCK_N,
     ),
     tile_num=(NUM_BLOCK_M, NUM_BLOCK_N, 1),
-    reads=[A],
-    writes=[B],
+    reads=[
+        A.region(
+            lambda m, n, k: R[
+                m * BLOCK_M : (m + 1) * BLOCK_M,
+                n * BLOCK_N : (n + 1) * BLOCK_N,
+            ]
+        )
+    ],
+    writes=[B.region(lambda m, n, k: R[m * BLOCK_M : (m + 1) * BLOCK_M, n])],
     attrs={
         "source_stage": "B = reduce_each_n_block(A)",
     },
@@ -189,8 +206,8 @@ stage2 = kernel.tile(
         num_block_n=NUM_BLOCK_N,
     ),
     tile_num=(NUM_BLOCK_M, 1, 1),
-    reads=[B],
-    writes=[C],
+    reads=[B.region(lambda m, n, k: R[m * BLOCK_M : (m + 1) * BLOCK_M, 0:NUM_BLOCK_N])],
+    writes=[C.region(lambda m, n, k: R[m * BLOCK_M : (m + 1) * BLOCK_M, 0])],
     attrs={
         "source_stage": "C = reduce_all_n_blocks(B)",
     },

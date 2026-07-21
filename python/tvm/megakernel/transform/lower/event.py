@@ -172,7 +172,9 @@ def emit_events(
 ) -> None:
     if not dependencies:
         return
-    for event, coord_map in dependencies:
+    for dependency in dependencies:
+        event = dependency.event
+        coord_map = dependency.coord_from_tile
         coord = coord_from_map(coord_map, m_idx, n_idx, k_idx)
         if event.name not in event_bindings:
             if options.emit_event_markers:

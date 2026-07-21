@@ -14,7 +14,7 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-"""Prepare lower-private static state from semantic megakernel plans."""
+"""Prepare lower-private state from semantic megakernel plans."""
 
 from __future__ import annotations
 
@@ -23,7 +23,15 @@ import keyword
 import re
 from typing import Any
 
-from ...dsl import EventSpec, ExprSpec, KernelSpec, TensorSpec, TileSpec, VarSpec, expr_bounds
+from ...dsl import (
+    EventSpec,
+    ExprSpec,
+    KernelSpec,
+    TensorSpec,
+    TileSpec,
+    VarSpec,
+    expr_bounds,
+)
 from ..semantic import SemanticPlan
 
 INIT_EVENT_JOB_ID = 29
@@ -86,7 +94,7 @@ class EventLayout:
 
 @dataclass(frozen=True)
 class TilePlan:
-    """Static tile binding consumed by the TIRX emitter."""
+    """Tile binding consumed by the TIRX emitter."""
 
     info: TileLoweringInfo
     tile_num: Any
@@ -104,7 +112,7 @@ class TilePlan:
 
 @dataclass(frozen=True)
 class TaskPhase:
-    """A task range materialized by the static queue init kernel."""
+    """A task range materialized by the queue init kernel."""
 
     kind: str
     job_id: int
@@ -136,8 +144,58 @@ class StaticSchedulePlan:
         }
 
 
+@dataclass(frozen=True)
+class DynamicTrigger:
+    """One dynamic task push emitted after a producer notification."""
+
+    event: EventSpec
+    producer: TilePlan
+    consumer: TilePlan
+    consumer_coord_map: Any
+    consumer_inverse_coord_map: Any | None
+
+
+@dataclass(frozen=True)
+class DynamicSchedulePlan:
+    """Dynamic task queue plan consumed by the TIRX emitter."""
+
+    entry_phases: tuple[TaskPhase, ...]
+    triggers: dict[str, tuple[DynamicTrigger, ...]]
+    endpoint: TilePlan | None
+    max_tasks: int
+    end_job_id: int
+
+    def normalized_data(self) -> dict[str, Any]:
+        return {
+            "max_tasks": self.max_tasks,
+            "end_job_id": self.end_job_id,
+            "entry_phases": [
+                {
+                    "kind": phase.kind,
+                    "job_id": phase.job_id,
+                    "tile_num": _data_value(phase.tile_num),
+                    "label": phase.label,
+                }
+                for phase in self.entry_phases
+            ],
+            "triggers": {
+                name: [
+                    {
+                        "event": trigger.event.name,
+                        "producer": trigger.producer.tile.name,
+                        "consumer": trigger.consumer.tile.name,
+                        "has_inverse_coord_map": trigger.consumer_inverse_coord_map is not None,
+                    }
+                    for trigger in triggers
+                ]
+                for name, triggers in self.triggers.items()
+            },
+            "endpoint": None if self.endpoint is None else self.endpoint.tile.name,
+        }
+
+
 @dataclass
-class StaticLoweringPlan:
+class LoweringPlan:
     """Prepared lower-private plan used by the default TIRX emitter."""
 
     semantic: SemanticPlan
@@ -154,6 +212,7 @@ class StaticLoweringPlan:
     tile_plans: list[TilePlan] = field(default_factory=list)
     tile_plan_map: dict[str, TilePlan] = field(default_factory=dict)
     static_schedule: StaticSchedulePlan | None = None
+    dynamic_schedule: DynamicSchedulePlan | None = None
     smem_manager: Any | None = None
     event_bindings: dict[str, Any] = field(default_factory=dict)
     event_init_complete: Any | None = None
@@ -203,19 +262,18 @@ class StaticLoweringPlan:
                     "name": tile_plan.tile.name,
                     "job_id": tile_plan.job_id,
                     "tile_num": _data_value(tile_plan.tile_num),
-                    "waits": [{"event": event.name} for event, _ in tile_plan.waits],
-                    "notifies": [{"event": event.name} for event, _ in tile_plan.notifies],
+                    "waits": [{"event": dep.event.name} for dep in tile_plan.waits],
+                    "notifies": [{"event": dep.event.name} for dep in tile_plan.notifies],
                 }
                 for tile_plan in self.tile_plans
             ],
             "static_schedule": (
                 None if self.static_schedule is None else self.static_schedule.normalized_data()
             ),
+            "dynamic_schedule": (
+                None if self.dynamic_schedule is None else self.dynamic_schedule.normalized_data()
+            ),
         }
-
-
-NormalizedMegakernelPlan = StaticLoweringPlan
-KernelLoweringPlan = StaticLoweringPlan
 
 
 def _data_value(value: Any) -> Any:
@@ -230,23 +288,24 @@ def _data_value(value: Any) -> Any:
     return value
 
 
-def prepare_static_lowering_plan(
+def prepare_lowering_plan(
     semantic: SemanticPlan, options: LoweringOptions
-) -> StaticLoweringPlan:
-    """Create the default static lowering plan."""
+) -> LoweringPlan:
+    """Create the lower-private plan for the selected schedule."""
 
-    plan = StaticLoweringPlan(semantic=semantic, options=options)
+    plan = LoweringPlan(semantic=semantic, options=options)
     _bind_vars(plan)
     _bind_tensors(plan)
     _bind_tiles(plan)
     _build_event_layouts(plan)
     _build_tile_plans(plan)
-    _build_schedule_plan(plan)
+    _build_static_schedule_plan(plan)
+    _build_dynamic_schedule_plan(plan)
     return plan
 
 
-def plan_event_workspace_size(plan: StaticLoweringPlan) -> Any:
-    """Return the statically reserved event workspace length."""
+def plan_event_workspace_size(plan: LoweringPlan) -> Any:
+    """Return the reserved event workspace length."""
 
     if not plan.event_layouts:
         return 0
@@ -263,7 +322,7 @@ def plan_event_workspace_size(plan: StaticLoweringPlan) -> Any:
 
 
 def shape_tuple(
-    shape: Any, context: str, plan: StaticLoweringPlan | None = None
+    shape: Any, context: str, plan: LoweringPlan | None = None
 ) -> tuple[Any, ...]:
     """Lower one DSL shape to a tuple, resolving VarSpec when a plan is bound."""
 
@@ -279,7 +338,7 @@ def shape_product(shape: tuple[Any, ...]) -> Any:
     return result
 
 
-def lower_expr_like(value: Any, context: str, plan: StaticLoweringPlan | None = None) -> Any:
+def lower_expr_like(value: Any, context: str, plan: LoweringPlan | None = None) -> Any:
     if isinstance(value, int) and not isinstance(value, bool):
         return value
     if isinstance(value, VarSpec):
@@ -291,7 +350,7 @@ def lower_expr_like(value: Any, context: str, plan: StaticLoweringPlan | None = 
     raise TypeError(f"{context} must be an int, VarSpec, or ExprSpec, got {value!r}")
 
 
-def _lower_expr_spec(expr: ExprSpec, context: str, plan: StaticLoweringPlan | None) -> Any:
+def _lower_expr_spec(expr: ExprSpec, context: str, plan: LoweringPlan | None) -> Any:
     args = [lower_expr_like(arg, context, plan) for arg in expr.args]
     if expr.op == "add":
         return args[0] + args[1]
@@ -334,7 +393,7 @@ def upper_bound_shape_product(
     return result
 
 
-def _bind_vars(plan: StaticLoweringPlan) -> None:
+def _bind_vars(plan: LoweringPlan) -> None:
     used_names: set[str] = set()
     for var in plan.semantic.vars:
         param_name = _sanitize_identifier(var.name, used_names)
@@ -342,7 +401,7 @@ def _bind_vars(plan: StaticLoweringPlan) -> None:
         plan.var_bindings[var] = VarBinding(var=var, param_name=param_name)
 
 
-def _bind_tensors(plan: StaticLoweringPlan) -> None:
+def _bind_tensors(plan: LoweringPlan) -> None:
     used_names: set[str] = set()
     for tensor in plan.semantic.tensors:
         param_name = _sanitize_identifier(tensor.name, used_names)
@@ -350,7 +409,7 @@ def _bind_tensors(plan: StaticLoweringPlan) -> None:
         plan.tensor_bindings[tensor] = TensorBinding(tensor=tensor, param_name=param_name)
 
 
-def _bind_tiles(plan: StaticLoweringPlan) -> None:
+def _bind_tiles(plan: LoweringPlan) -> None:
     for job_id, tile in enumerate(plan.semantic.tiles):
         info = TileLoweringInfo(tile=tile, job_id=job_id, class_key=type(tile.impl))
         tensor_bindings = {}
@@ -363,7 +422,7 @@ def _bind_tiles(plan: StaticLoweringPlan) -> None:
         plan.tiles.append(info)
 
 
-def _build_event_layouts(plan: StaticLoweringPlan) -> None:
+def _build_event_layouts(plan: LoweringPlan) -> None:
     offset: Any = 0
     for event in plan.semantic.events:
         size = upper_bound_shape_product(
@@ -391,7 +450,7 @@ def _build_event_layouts(plan: StaticLoweringPlan) -> None:
         )
 
 
-def _build_tile_plans(plan: StaticLoweringPlan) -> None:
+def _build_tile_plans(plan: LoweringPlan) -> None:
     for tile_info in plan.tiles:
         tile = tile_info.tile
         tile_plan = TilePlan(
@@ -404,7 +463,7 @@ def _build_tile_plans(plan: StaticLoweringPlan) -> None:
         plan.tile_plan_map[tile.name] = tile_plan
 
 
-def _build_schedule_plan(plan: StaticLoweringPlan) -> None:
+def _build_static_schedule_plan(plan: LoweringPlan) -> None:
     if plan.options.schedule != "static":
         return
     attrs = plan.options.attrs
@@ -445,6 +504,47 @@ def _build_schedule_plan(plan: StaticLoweringPlan) -> None:
         phases=tuple(phases), max_tasks=max_tasks, end_job_id=end_job_id
     )
 
+
+def _build_dynamic_schedule_plan(plan: LoweringPlan) -> None:
+    if plan.options.schedule != "dynamic":
+        return
+    attrs = plan.options.attrs
+    max_tasks = attrs.get("max_tasks", DEFAULT_MAX_TASKS)
+    end_job_id = attrs.get("end_job_id", 31)
+    entry_tiles = [tile_plan for tile_plan in plan.tile_plans if not tile_plan.waits]
+    entry_phases = tuple(_tile_phase(tile_plan) for tile_plan in entry_tiles)
+
+    tile_plan_by_tile = {id(tile_plan.tile): tile_plan for tile_plan in plan.tile_plans}
+    triggers: dict[str, list[DynamicTrigger]] = {}
+    for producer in plan.tile_plans:
+        producer_triggers: list[DynamicTrigger] = []
+        for notify_dep in producer.notifies:
+            notify_event = notify_dep.event
+            for consumer_tile in plan.semantic.tiles:
+                for wait_dep in consumer_tile.waits:
+                    wait_event = wait_dep.event
+                    if wait_event is not notify_event:
+                        continue
+                    producer_triggers.append(
+                        DynamicTrigger(
+                            event=notify_event,
+                            producer=producer,
+                            consumer=tile_plan_by_tile[id(consumer_tile)],
+                            consumer_coord_map=wait_dep.coord_from_tile,
+                            consumer_inverse_coord_map=wait_dep.inverse_coord_from_event,
+                        )
+                    )
+        if producer_triggers:
+            triggers[producer.tile.name] = producer_triggers
+
+    endpoints = [tile_plan for tile_plan in plan.tile_plans if not tile_plan.notifies]
+    plan.dynamic_schedule = DynamicSchedulePlan(
+        entry_phases=entry_phases,
+        triggers={name: tuple(value) for name, value in triggers.items()},
+        endpoint=endpoints[0] if endpoints else None,
+        max_tasks=max_tasks,
+        end_job_id=end_job_id,
+    )
 
 def _tile_phase(tile_plan: TilePlan) -> TaskPhase:
     return TaskPhase(
@@ -487,14 +587,22 @@ def replace_tensor_specs(value: Any, bindings: dict[TensorSpec, TensorBinding]) 
     return value
 
 
+NormalizedMegakernelPlan = LoweringPlan
+KernelLoweringPlan = LoweringPlan
+StaticLoweringPlan = LoweringPlan
+prepare_static_lowering_plan = prepare_lowering_plan
+
 __all__ = [
     "DEFAULT_MAX_TASKS",
+    "DynamicTrigger",
+    "DynamicSchedulePlan",
     "EVENT_INIT_COMPLETE_NAME",
     "INIT_EVENT_JOB_ID",
     "WAIT_EVENT_INIT_JOB_ID",
     "EventLayout",
     "KernelLoweringPlan",
     "LoweringOptions",
+    "LoweringPlan",
     "NormalizedMegakernelPlan",
     "StaticLoweringPlan",
     "StaticSchedulePlan",
@@ -505,6 +613,7 @@ __all__ = [
     "VarBinding",
     "lower_expr_like",
     "plan_event_workspace_size",
+    "prepare_lowering_plan",
     "prepare_static_lowering_plan",
     "raw_shape_product",
     "upper_bound_shape_product",

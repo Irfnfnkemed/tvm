@@ -24,10 +24,13 @@ from itertools import product
 from operator import mul
 import random
 from typing import Any
+import warnings
 
 from ...dsl import EventSpec, ExprSpec, RegionRange, RegionSpec, TensorSpec, VarSpec, eval_expr_like, expr_vars
 from .build import event_init_count
+from .impl_access import collect_impl_access
 from .model import SemanticPlan
+from .region import region_label, region_set_covers, regions_overlap
 
 
 def validate_semantic_plan(plan: SemanticPlan) -> SemanticPlan:
@@ -49,7 +52,9 @@ def validate_semantic_plan(plan: SemanticPlan) -> SemanticPlan:
         for tensor in tile.writes:
             _validate_tile_tensor_access(tile, tensor, tensor_ids)
         notified_events: set[int] = set()
-        for event, coord_map in tile.notifies:
+        for dependency in tile.notifies:
+            event = dependency.event
+            coord_map = dependency.coord_from_tile
             if id(event) not in event_ids:
                 raise ValueError(f"tile {tile.name!r} notifies event outside kernel")
             if id(event) in notified_events:
@@ -61,7 +66,9 @@ def validate_semantic_plan(plan: SemanticPlan) -> SemanticPlan:
             if tile not in producers[id(event)]:
                 producers[id(event)].append(tile)
         waited_events: set[int] = set()
-        for event, coord_map in tile.waits:
+        for dependency in tile.waits:
+            event = dependency.event
+            coord_map = dependency.coord_from_tile
             if id(event) not in event_ids:
                 raise ValueError(f"tile {tile.name!r} waits on event outside kernel")
             if id(event) in waited_events:
@@ -81,8 +88,102 @@ def validate_semantic_plan(plan: SemanticPlan) -> SemanticPlan:
         _validate_static_event_counts(event, producers[id(event)], consumers[id(event)])
 
     _validate_region_dependencies(plan, var_ids)
+    _validate_impl_access_contract(plan)
 
     return plan
+
+
+
+def _validate_impl_access_contract(plan: SemanticPlan) -> None:
+    tensor_ids = {id(tensor) for tensor in plan.tensors}
+    envs = _sample_plan_envs(plan)
+    for tile in plan.tiles:
+        policy = tile.attrs.get("impl_access_validate", "error")
+        if policy not in ("error", "warn", "off"):
+            raise ValueError(
+                f"tile {tile.name!r} has unsupported impl_access_validate policy {policy!r}"
+            )
+        if policy == "off":
+            continue
+        impl_tensors = _tile_impl_tensor_attrs(tile, tensor_ids)
+        if not impl_tensors:
+            continue
+        try:
+            actual = collect_impl_access(tile.impl, tensors=impl_tensors, hooks=("prefetch", "run"))
+        except Exception as err:
+            _handle_impl_access_issue(
+                tile, policy, f"impl access collection failed: {err}", force_error=True
+            )
+            continue
+        for effect in actual.unknown_effects:
+            warnings.warn(
+                f"tile {tile.name!r} impl has unknown access effect: {effect}",
+                stacklevel=2,
+            )
+        _validate_actual_accesses(tile, actual.reads, tile.reads, "read", envs, policy)
+        _validate_actual_accesses(tile, actual.writes, tile.writes, "write", envs, policy)
+
+
+def _handle_impl_access_issue(
+    tile, policy: str, message: str, *, force_error: bool = False
+) -> None:
+    full_message = f"tile {tile.name!r} {message}"
+    if force_error or policy == "error":
+        raise ValueError(full_message)
+    warnings.warn(full_message, stacklevel=3)
+
+
+def _tile_impl_tensor_attrs(tile, tensor_ids: set[int]) -> dict[str, TensorSpec]:
+    result: dict[str, TensorSpec] = {}
+    for attr_name, value in vars(tile.impl).items():
+        if isinstance(value, TensorSpec) and id(value.base_tensor) in tensor_ids:
+            result[attr_name] = value.base_tensor
+    return result
+
+
+def _validate_actual_accesses(tile, actual_accesses, declared_accesses, kind: str, envs, policy: str) -> None:
+    declared_by_tensor: dict[TensorSpec, list[TensorSpec]] = defaultdict(list)
+    for access in declared_accesses:
+        declared_by_tensor[access.base_tensor].append(access)
+
+    for actual in actual_accesses:
+        tensor = actual.tensor.base_tensor
+        candidates = declared_by_tensor.get(tensor, [])
+        if not candidates:
+            _handle_impl_access_issue(
+                tile,
+                policy,
+                f"impl {kind}s tensor {tensor.name!r} but tile.{kind}s does not declare it",
+            )
+            continue
+        if any(declared.region_from_tile is None for declared in candidates):
+            continue
+        if actual.tensor.region_from_tile is None:
+            warnings.warn(
+                f"tile {tile.name!r} impl {kind}s tensor {tensor.name!r} with unknown region; "
+                "cannot prove declared region coverage",
+                stacklevel=2,
+            )
+            continue
+        for env in envs:
+            tile_extents = _static_int_tuple(tile.tile_num, env)
+            if tile_extents is None:
+                continue
+            for idx in product(*(range(extent) for extent in tile_extents)):
+                actual_region = _region_from_access(actual.tensor, env, *idx)
+                declared_regions = [
+                    _region_from_access(declared, env, *idx) for declared in candidates
+                ]
+                if region_set_covers(declared_regions, actual_region):
+                    continue
+                _handle_impl_access_issue(
+                    tile,
+                    policy,
+                    f"impl {kind}s tensor {tensor.name!r} region "
+                    f"{region_label(actual_region)} outside declared tile.{kind}s regions",
+                )
+                break
+
 
 
 def _validate_kernel_expr_ownership(plan: SemanticPlan, var_ids: set[int]) -> None:
@@ -110,10 +211,10 @@ def _validate_region_dependencies(plan: SemanticPlan, var_ids: set[int]) -> None
     tensor_ids = {id(tensor) for tensor in plan.tensors}
     for tile in plan.tiles:
         for access in tile.reads:
-            if access.has_region:
+            if access.region_from_tile is not None:
                 _validate_tensor_region_access(tile, access, tensor_ids, is_write=False, var_ids=var_ids)
         for access in tile.writes:
-            if access.has_region:
+            if access.region_from_tile is not None:
                 _validate_tensor_region_access(tile, access, tensor_ids, is_write=True, var_ids=var_ids)
 
     _validate_tensor_dependency_events(plan)
@@ -126,14 +227,14 @@ def _validate_tensor_dependency_events(plan: SemanticPlan) -> None:
         write_tensors = {_base_tensor(access) for access in producer.writes}
         if not write_tensors:
             continue
-        notify_events = {id(event) for event, _ in producer.notifies}
+        notify_events = {id(dep.event) for dep in producer.notifies}
         for consumer in plan.tiles:
             if consumer is producer:
                 continue
             shared_tensors = write_tensors & {_base_tensor(access) for access in consumer.reads}
             if not shared_tensors:
                 continue
-            wait_events = {id(event) for event, _ in consumer.waits}
+            wait_events = {id(dep.event) for dep in consumer.waits}
             if notify_events & wait_events:
                 continue
             tensor_names = sorted(tensor.name for tensor in shared_tensors)
@@ -150,7 +251,7 @@ def _validate_region_dependency_coords(plan: SemanticPlan) -> None:
             producer_extents = _static_int_tuple(producer.tile_num, env)
             if producer_extents is None:
                 continue
-            producer_writes = [access for access in producer.writes if access.has_region]
+            producer_writes = list(producer.writes)
             if not producer_writes:
                 continue
             for consumer in plan.tiles:
@@ -159,7 +260,7 @@ def _validate_region_dependency_coords(plan: SemanticPlan) -> None:
                 consumer_extents = _static_int_tuple(consumer.tile_num, env)
                 if consumer_extents is None:
                     continue
-                consumer_reads = [access for access in consumer.reads if access.has_region]
+                consumer_reads = list(consumer.reads)
                 if not consumer_reads:
                     continue
                 for producer_idx in product(*(range(extent) for extent in producer_extents)):
@@ -180,7 +281,7 @@ def _validate_region_dependency_coords(plan: SemanticPlan) -> None:
                                 _validate_region_bounds(
                                     tensor, read_region, tensor_shape, f"{consumer.name}.read_region"
                                 )
-                                if not _regions_overlap(write_region, read_region):
+                                if not regions_overlap(write_region, read_region):
                                     continue
                                 if _has_matching_event_coord(
                                     producer, producer_idx, consumer, consumer_idx, env
@@ -188,9 +289,9 @@ def _validate_region_dependency_coords(plan: SemanticPlan) -> None:
                                     continue
                                 raise ValueError(
                                     f"tile {consumer.name!r} idx {consumer_idx} reads tensor "
-                                    f"{tensor.name!r} region {_region_label(read_region)} that overlaps "
+                                    f"{tensor.name!r} region {region_label(read_region)} that overlaps "
                                     f"tile {producer.name!r} idx {producer_idx} write region "
-                                    f"{_region_label(write_region)} without an event dependency"
+                                    f"{region_label(write_region)} without an event dependency"
                                 )
 
 
@@ -201,7 +302,7 @@ def _validate_waited_region_sources(plan: SemanticPlan) -> None:
             consumer_extents = _static_int_tuple(consumer.tile_num, env)
             if consumer_extents is None:
                 continue
-            consumer_reads = [access for access in consumer.reads if access.has_region]
+            consumer_reads = list(consumer.reads)
             if not consumer_reads or not consumer.waits:
                 continue
             for consumer_idx in product(*(range(extent) for extent in consumer_extents)):
@@ -214,7 +315,9 @@ def _validate_waited_region_sources(plan: SemanticPlan) -> None:
                     _validate_region_bounds(
                         tensor, read_region, tensor_shape, f"{consumer.name}.read_region"
                     )
-                    for wait_event, wait_map in consumer.waits:
+                    for dependency in consumer.waits:
+                        wait_event = dependency.event
+                        wait_map = dependency.coord_from_tile
                         wait_coord = _resolve_coord(_coord_from_map(wait_map, *consumer_idx), env)
                         _validate_waited_region_source(
                             plan, consumer, consumer_idx, tensor, read_region,
@@ -227,7 +330,7 @@ def _validate_waited_region_source(
     consumer,
     consumer_idx,
     tensor: TensorSpec,
-    read_region: RegionSpec,
+    read_region: RegionSpec | None,
     wait_event: EventSpec,
     wait_coord: tuple[Any, ...],
     env,
@@ -236,12 +339,10 @@ def _validate_waited_region_source(
     for producer in plan.tiles:
         if producer is consumer:
             continue
-        producer_writes = [
-            access for access in producer.writes if access.has_region and access.base_tensor is tensor
-        ]
+        producer_writes = [access for access in producer.writes if access.base_tensor is tensor]
         if not producer_writes:
             continue
-        if not any(event is wait_event for event, _ in producer.notifies):
+        if not any(dep.event is wait_event for dep in producer.notifies):
             continue
         has_same_tensor_event_writer = True
         producer_extents = _static_int_tuple(producer.tile_num, env)
@@ -256,19 +357,21 @@ def _validate_waited_region_source(
                     tensor, write_region, _static_int_tuple(tensor.shape, env),
                     f"{producer.name}.write_region"
                 )
-                if _regions_overlap(write_region, read_region):
+                if regions_overlap(write_region, read_region):
                     return
     if has_same_tensor_event_writer:
         raise ValueError(
             f"tile {consumer.name!r} idx {consumer_idx} waits on event {wait_event.name!r} "
             f"coord {wait_coord} and reads tensor {tensor.name!r} region "
-            f"{_region_label(read_region)}, but no producer notifying that coord writes an "
+            f"{region_label(read_region)}, but no producer notifying that coord writes an "
             "overlapping region"
         )
 
 
 def _producer_notifies_coord(producer, producer_idx, wait_event, wait_coord, env) -> bool:
-    for notify_event, notify_map in producer.notifies:
+    for dependency in producer.notifies:
+        notify_event = dependency.event
+        notify_map = dependency.coord_from_tile
         if notify_event is not wait_event:
             continue
         notify_coord = _resolve_coord(_coord_from_map(notify_map, *producer_idx), env)
@@ -282,9 +385,13 @@ def _base_tensor(access: TensorSpec) -> TensorSpec:
 
 
 def _has_matching_event_coord(producer, producer_idx, consumer, consumer_idx, env) -> bool:
-    for notify_event, notify_map in producer.notifies:
+    for notify_dep in producer.notifies:
+        notify_event = notify_dep.event
+        notify_map = notify_dep.coord_from_tile
         notify_coord = _resolve_coord(_coord_from_map(notify_map, *producer_idx), env)
-        for wait_event, wait_map in consumer.waits:
+        for wait_dep in consumer.waits:
+            wait_event = wait_dep.event
+            wait_map = wait_dep.coord_from_tile
             if wait_event is not notify_event:
                 continue
             wait_coord = _resolve_coord(_coord_from_map(wait_map, *consumer_idx), env)
@@ -293,8 +400,8 @@ def _has_matching_event_coord(producer, producer_idx, consumer, consumer_idx, en
     return False
 
 
-def _regions_overlap(lhs: RegionSpec, rhs: RegionSpec) -> bool:
-    if lhs.dynamic or rhs.dynamic:
+def regions_overlap(lhs: RegionSpec | None, rhs: RegionSpec | None) -> bool:
+    if lhs is None or rhs is None:
         return True
     if len(lhs.dims) != len(rhs.dims):
         return False
@@ -318,30 +425,31 @@ def _validate_tensor_region_access(
     tensor = access.base_tensor
     if id(tensor) not in tensor_ids:
         raise ValueError(f"tile {tile.name!r} has {kind} region for tensor outside kernel")
-    if access.region_dynamic:
+    if access.region_from_tile is None:
         return
-    _validate_region_map_shape(
-        tensor, access.region_map, tile.tile_num, f"{tile.name}.{kind}_region", var_ids
+    _validate_region_from_tile_shape(
+        tensor, access.region_from_tile, tile.tile_num, f"{tile.name}.{kind}_region", var_ids
     )
 
 
-def _region_from_access(access: TensorSpec, env, m_idx, n_idx, k_idx) -> RegionSpec:
-    if access.region_dynamic:
-        return RegionSpec(dynamic=True, reason=access.region_reason)
-    return _resolve_region(_region_from_map(access.region_map, m_idx, n_idx, k_idx), env)
+def _region_from_access(access: TensorSpec, env, m_idx, n_idx, k_idx) -> RegionSpec | None:
+    if access.region_from_tile is None:
+        return None
+    return _resolve_region(_region_from_tile(access.region_from_tile, m_idx, n_idx, k_idx), env)
 
-def _region_from_map(region_map, m_idx, n_idx, k_idx) -> RegionSpec:
-    region = region_map(m_idx, n_idx, k_idx) if callable(region_map) else region_map
+
+def _region_from_tile(region_from_tile, m_idx, n_idx, k_idx) -> RegionSpec:
+    region = region_from_tile(m_idx, n_idx, k_idx) if callable(region_from_tile) else region_from_tile
     if isinstance(region, RegionSpec):
         return region
     if isinstance(region, (tuple, list)):
         return RegionSpec(dims=tuple(RegionRange(value, 1) for value in region))
-    raise TypeError(f"region_map must return RegionSpec, tuple, or list, got {region!r}")
+    raise TypeError(f"region_from_tile must return RegionSpec, tuple, or list, got {region!r}")
 
 
-def _resolve_region(region: RegionSpec, env: dict[VarSpec, int] | None) -> RegionSpec:
-    if region.dynamic:
-        return region
+def _resolve_region(region: RegionSpec | None, env: dict[VarSpec, int] | None) -> RegionSpec | None:
+    if region is None:
+        return None
     return RegionSpec(
         dims=tuple(
             RegionRange(
@@ -349,22 +457,20 @@ def _resolve_region(region: RegionSpec, env: dict[VarSpec, int] | None) -> Regio
                 extent=_resolve_expr_value(dim.extent, env),
             )
             for dim in region.dims
-        ),
-        dynamic=region.dynamic,
-        reason=region.reason,
+        )
     )
 
 
-def _validate_region_map_shape(
-    tensor: TensorSpec, region_map, tile_num, label: str, var_ids: set[int] | None = None
+def _validate_region_from_tile_shape(
+    tensor: TensorSpec, region_from_tile, tile_num, label: str, var_ids: set[int] | None = None
 ) -> None:
     rank = len(_shape_tuple(tensor.shape))
     tile_extents = _static_int_tuple(tile_num)
     sample = (0, 0, 0)
     if tile_extents is not None:
         sample = tuple(0 for _ in tile_extents)
-    region = _region_from_map(region_map, *sample)
-    if region.dynamic:
+    region = _region_from_tile(region_from_tile, *sample)
+    if region is None:
         return
     if len(region.dims) != rank:
         raise ValueError(
@@ -380,9 +486,9 @@ def _validate_region_map_shape(
 
 
 def _validate_region_bounds(
-    tensor: TensorSpec, region: RegionSpec, shape: tuple[int, ...], label: str
+    tensor: TensorSpec, region: RegionSpec | None, shape: tuple[int, ...], label: str
 ) -> None:
-    if region.dynamic:
+    if region is None:
         return
     if len(region.dims) != len(shape):
         raise ValueError(
@@ -395,17 +501,17 @@ def _validate_region_bounds(
         if not isinstance(dim.extent, int) or isinstance(dim.extent, bool):
             raise TypeError(f"{label} static region contains non-integer extent {dim.extent!r}")
         if dim.extent <= 0:
-            raise ValueError(f"{label} region {_region_label(region)} has non-positive extent")
+            raise ValueError(f"{label} region {region_label(region)} has non-positive extent")
         if dim.start < 0 or dim.start + dim.extent > extent:
             raise ValueError(
-                f"{label} region {_region_label(region)} is out of bounds for tensor "
+                f"{label} region {region_label(region)} is out of bounds for tensor "
                 f"{tensor.name!r} shape {shape}"
             )
 
 
-def _region_label(region: RegionSpec) -> str:
-    if region.dynamic:
-        return f"dynamic({region.reason})" if region.reason else "dynamic"
+def region_label(region: RegionSpec | None) -> str:
+    if region is None:
+        return "unknown"
     parts = []
     for dim in region.dims:
         if dim.extent == 1:
@@ -516,7 +622,9 @@ def _validate_event_counts_for_shape(
         if tile_extents is None:
             return
         for idx in product(*(range(extent) for extent in tile_extents)):
-            for notify_event, coord_map in producer.notifies:
+            for dependency in producer.notifies:
+                notify_event = dependency.event
+                coord_map = dependency.coord_from_tile
                 if notify_event is not event:
                     continue
                 coord = _resolve_coord(_coord_from_map(coord_map, *idx), env)
@@ -537,7 +645,9 @@ def _validate_event_counts_for_shape(
         if tile_extents is None:
             return
         for idx in product(*(range(extent) for extent in tile_extents)):
-            for wait_event, coord_map in consumer.waits:
+            for dependency in consumer.waits:
+                wait_event = dependency.event
+                coord_map = dependency.coord_from_tile
                 if wait_event is not event:
                     continue
                 coord = _resolve_coord(_coord_from_map(coord_map, *idx), env)

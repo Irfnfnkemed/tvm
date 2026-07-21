@@ -20,7 +20,11 @@ from __future__ import annotations
 
 import pytest
 
+import tvm.tirx.script as T
+from tvm.tirx.script import tile as Tx
+
 from tvm.megakernel.dsl import KernelSpec, R, TileImpl
+from tvm.megakernel.dsl.spec import DependencySpec
 from tvm.megakernel.transform.semantic import build_semantic_plan, validate_semantic_plan
 
 
@@ -114,7 +118,7 @@ def test_semantic_allows_bare_tensor_access_with_event_dependency():
 def test_semantic_rejects_foreign_notify_event():
     kernel, _, _, producer, _ = _basic_kernel()
     foreign = KernelSpec("foreign_event").event("foreign", (1,), 1)
-    producer.notifies[0] = (foreign, lambda m, n, k: (0,))
+    producer.notifies[0] = DependencySpec(foreign, lambda m, n, k: (0,))
 
     with pytest.raises(ValueError, match="event outside kernel"):
         _validate(kernel)
@@ -123,7 +127,7 @@ def test_semantic_rejects_foreign_notify_event():
 def test_semantic_rejects_foreign_wait_event():
     kernel, _, _, _, consumer = _basic_kernel()
     foreign = KernelSpec("foreign_event").event("foreign", (1,), 1)
-    consumer.waits[0] = (foreign, lambda m, n, k: (0,))
+    consumer.waits[0] = DependencySpec(foreign, lambda m, n, k: (0,))
 
     with pytest.raises(ValueError, match="event outside kernel"):
         _validate(kernel)
@@ -139,7 +143,7 @@ def test_semantic_rejects_foreign_wait_event():
 )
 def test_semantic_rejects_invalid_coord_map_shape(coord_map, error, match):
     kernel, _, ready, producer, _ = _basic_kernel()
-    producer.notifies[0] = (ready, coord_map)
+    producer.notifies[0] = DependencySpec(ready, coord_map)
 
     with pytest.raises(error, match=match):
         _validate(kernel)
@@ -163,7 +167,7 @@ def test_semantic_rejects_notify_without_consumer():
 
 def test_semantic_rejects_notify_count_mismatch():
     kernel, _, ready, producer, _ = _basic_kernel()
-    producer.notifies[0] = (ready, lambda m, n, k: (m, 0))
+    producer.notifies[0] = DependencySpec(ready, lambda m, n, k: (m, 0))
 
     with pytest.raises(ValueError, match="init_count"):
         _validate(kernel)
@@ -171,7 +175,7 @@ def test_semantic_rejects_notify_count_mismatch():
 
 def test_semantic_rejects_wait_out_of_bounds():
     kernel, _, ready, _, consumer = _basic_kernel()
-    consumer.waits[0] = (ready, lambda m, n, k: (m, 3))
+    consumer.waits[0] = DependencySpec(ready, lambda m, n, k: (m, 3))
 
     with pytest.raises(ValueError, match="out of bounds"):
         _validate(kernel)
@@ -208,7 +212,7 @@ def test_semantic_accepts_valid_symbolic_graph():
 
 def test_semantic_samples_symbolic_notify_count_mismatch():
     kernel, ready, producer, _ = _symbolic_kernel()
-    producer.notifies[0] = (ready, lambda m, n, k: (m, 0))
+    producer.notifies[0] = DependencySpec(ready, lambda m, n, k: (m, 0))
 
     with pytest.raises(ValueError, match="init_count"):
         _validate(kernel)
@@ -216,7 +220,7 @@ def test_semantic_samples_symbolic_notify_count_mismatch():
 
 def test_semantic_samples_symbolic_wait_swapped_coords():
     kernel, ready, _, consumer = _symbolic_kernel()
-    consumer.waits[0] = (ready, lambda m, n, k: (n, m))
+    consumer.waits[0] = DependencySpec(ready, lambda m, n, k: (n, m))
 
     with pytest.raises(ValueError, match="out of bounds|without a producer notify"):
         _validate(kernel)
@@ -253,12 +257,12 @@ def test_semantic_accepts_varspec_expression_in_shape_event_and_tile_num():
     tensor = kernel.tensor("x", (rows + 1,), "float32")
     ready = kernel.event("ready", (blocks,), init_count=1)
 
-    kernel.tile("producer", EmptyTile(), (blocks, 1, 1), writes=[tensor]).notify(
-        ready, lambda m, n, k: (m,)
-    )
-    kernel.tile("consumer", EmptyTile(), (blocks, 1, 1), reads=[tensor]).wait(
-        ready, lambda m, n, k: (m,)
-    )
+    kernel.tile(
+        "producer", EmptyTile(), (blocks, 1, 1), writes=[tensor.region(lambda m, n, k: R[m])]
+    ).notify(ready, lambda m, n, k: (m,))
+    kernel.tile(
+        "consumer", EmptyTile(), (blocks, 1, 1), reads=[tensor.region(lambda m, n, k: R[m])]
+    ).wait(ready, lambda m, n, k: (m,))
 
     plan = _validate(kernel)
 
@@ -446,13 +450,13 @@ def test_semantic_accepts_partially_overlapping_region_with_event_dependency():
     _validate(kernel)
 
 
-def test_semantic_dynamic_write_conservatively_covers_static_read():
+def test_semantic_unknown_write_conservatively_covers_static_read():
     kernel = KernelSpec("semantic_dynamic_write")
     tensor = kernel.tensor("x", (16,), "float32")
     ready = kernel.event("ready", (1,), init_count=1)
 
     kernel.tile(
-        "producer", EmptyTile(), (1, 1, 1), writes=[tensor.region(dynamic=True, reason="runtime index")]
+        "producer", EmptyTile(), (1, 1, 1), writes=[tensor]
     ).notify(ready, lambda m, n, k: (0,))
     kernel.tile(
         "consumer", EmptyTile(), (1, 1, 1), reads=[tensor.region(lambda m, n, k: R[4:8])]
@@ -461,7 +465,7 @@ def test_semantic_dynamic_write_conservatively_covers_static_read():
     _validate(kernel)
 
 
-def test_semantic_dynamic_read_requires_event_dependency_from_writer():
+def test_semantic_unknown_read_requires_event_dependency_from_writer():
     kernel = KernelSpec("semantic_dynamic_read_no_dep")
     tensor = kernel.tensor("x", (16,), "float32")
 
@@ -469,7 +473,7 @@ def test_semantic_dynamic_read_requires_event_dependency_from_writer():
         "producer", EmptyTile(), (1, 1, 1), writes=[tensor.region(lambda m, n, k: R[0:16])]
     )
     kernel.tile(
-        "consumer", EmptyTile(), (1, 1, 1), reads=[tensor.region(dynamic=True, reason="runtime index")]
+        "consumer", EmptyTile(), (1, 1, 1), reads=[tensor]
     )
 
     with pytest.raises(ValueError, match="without an event dependency"):
@@ -551,4 +555,164 @@ def test_semantic_rejects_duplicate_wait_event_on_one_tile():
     consumer.wait(ready, lambda m, n, k: (m,))
 
     with pytest.raises(ValueError, match="waits on event .* more than once"):
+        _validate(kernel)
+
+
+class ImplCopyTile(TileImpl):
+    def __init__(self, src, out):
+        super().__init__()
+        self.src = src
+        self.out = out
+
+    @T.inline
+    def run(self, m_idx, n_idx, k_idx):
+        Tx.copy(self.out[0:8], self.src[0:8])
+
+
+def test_semantic_accepts_impl_access_matching_declared_regions():
+    kernel = KernelSpec("semantic_impl_access_ok")
+    src = kernel.tensor("src", (16,), "float32")
+    out = kernel.tensor("out", (16,), "float32")
+
+    kernel.tile(
+        "copy",
+        ImplCopyTile(src, out),
+        (1, 1, 1),
+        reads=[src.region(lambda m, n, k: R[0:8])],
+        writes=[out.region(lambda m, n, k: R[0:8])],
+    )
+
+    _validate(kernel)
+
+
+def test_semantic_rejects_impl_read_missing_from_tile_reads():
+    kernel = KernelSpec("semantic_impl_missing_read")
+    src = kernel.tensor("src", (16,), "float32")
+    out = kernel.tensor("out", (16,), "float32")
+
+    kernel.tile(
+        "copy",
+        ImplCopyTile(src, out),
+        (1, 1, 1),
+        reads=[],
+        writes=[out.region(lambda m, n, k: R[0:8])],
+    )
+
+    with pytest.raises(ValueError, match="impl reads tensor 'src'"):
+        _validate(kernel)
+
+
+def test_semantic_rejects_impl_write_missing_from_tile_writes():
+    kernel = KernelSpec("semantic_impl_missing_write")
+    src = kernel.tensor("src", (16,), "float32")
+    out = kernel.tensor("out", (16,), "float32")
+
+    kernel.tile(
+        "copy",
+        ImplCopyTile(src, out),
+        (1, 1, 1),
+        reads=[src.region(lambda m, n, k: R[0:8])],
+        writes=[],
+    )
+
+    with pytest.raises(ValueError, match="impl writes tensor 'out'"):
+        _validate(kernel)
+
+
+def test_semantic_rejects_impl_region_outside_declared_region():
+    kernel = KernelSpec("semantic_impl_region_too_wide")
+    src = kernel.tensor("src", (16,), "float32")
+    out = kernel.tensor("out", (16,), "float32")
+
+    kernel.tile(
+        "copy",
+        ImplCopyTile(src, out),
+        (1, 1, 1),
+        reads=[src.region(lambda m, n, k: R[0:4])],
+        writes=[out.region(lambda m, n, k: R[0:8])],
+    )
+
+    with pytest.raises(ValueError, match="outside declared tile.reads regions"):
+        _validate(kernel)
+
+
+class ImplUnknownRegionTile(TileImpl):
+    def __init__(self, src, out):
+        super().__init__()
+        self.src = src
+        self.out = out
+
+    @T.inline
+    def run(self, m_idx, n_idx, k_idx):
+        base = m_idx * 8
+        Tx.copy(self.out[base : base + 8], self.src[base : base + 8])
+
+
+def test_semantic_warns_on_unknown_impl_access_by_default():
+    kernel = KernelSpec("semantic_impl_unknown_warn")
+    src = kernel.tensor("src", (16,), "float32")
+    out = kernel.tensor("out", (16,), "float32")
+
+    kernel.tile(
+        "copy",
+        ImplUnknownRegionTile(src, out),
+        (1, 1, 1),
+        reads=[src],
+        writes=[out],
+    )
+
+    with pytest.warns(UserWarning, match="unknown access effect"):
+        _validate(kernel)
+
+
+def test_semantic_warn_policy_downgrades_impl_region_mismatch():
+    kernel = KernelSpec("semantic_impl_mismatch_warn")
+    src = kernel.tensor("src", (16,), "float32")
+    out = kernel.tensor("out", (16,), "float32")
+
+    kernel.tile(
+        "copy",
+        ImplCopyTile(src, out),
+        (1, 1, 1),
+        reads=[src.region(lambda m, n, k: R[0:4])],
+        writes=[out.region(lambda m, n, k: R[0:8])],
+        attrs={"impl_access_validate": "warn"},
+    )
+
+    with pytest.warns(UserWarning, match="outside declared tile.reads regions"):
+        _validate(kernel)
+
+
+def test_semantic_off_policy_skips_impl_access_validation():
+    kernel = KernelSpec("semantic_impl_mismatch_off")
+    src = kernel.tensor("src", (16,), "float32")
+    out = kernel.tensor("out", (16,), "float32")
+
+    kernel.tile(
+        "copy",
+        ImplCopyTile(src, out),
+        (1, 1, 1),
+        reads=[],
+        writes=[],
+        attrs={"impl_access_validate": "off"},
+    )
+
+    _validate(kernel)
+
+
+def test_semantic_rejects_invalid_impl_access_validate_policy():
+    kernel = KernelSpec("semantic_impl_bad_policy")
+    src = kernel.tensor("src", (16,), "float32")
+    out = kernel.tensor("out", (16,), "float32")
+
+    kernel.tile(
+        "copy",
+        ImplCopyTile(src, out),
+        (1, 1, 1),
+        reads=[src],
+        writes=[out],
+        attrs={"impl_access_validate": "maybe"},
+    )
+
+    with pytest.raises(ValueError, match="unsupported impl_access_validate"):
         _validate(kernel)
