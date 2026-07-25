@@ -16,51 +16,14 @@
 # under the License.
 """Megakernel DSL lowering transforms."""
 
-from .lower import (
-    LowerMegakernelDSL,
-    LoweringOptions,
-    MegakernelLowerer,
-    NormalizedMegakernelPlan,
-    lower_static_queue_init_to_tirx,
-    lower_to_tirx,
-    lower_to_tirx_module,
-)
-from .semantic import LogicalEdge, SemanticPlan, build_semantic_plan, validate_semantic_plan
-from .lower.prepare import (
-    EventLayout,
-    KernelLoweringPlan,
-    StaticLoweringPlan,
-    StaticSchedulePlan,
-    TaskPhase,
-    TensorBinding,
-    TileLoweringInfo,
-    TilePlan,
-    VarBinding,
-)
-from .lower.validate import validate_static_lowering_plan
+from .lower import LoweringOptions, lower
+from .validate import LogicalEdge, logical_edges, validate_impl, validate_kernel
 
 __all__ = [
-    "LowerMegakernelDSL",
     "LoweringOptions",
-    "MegakernelLowerer",
-    "NormalizedMegakernelPlan",
-    "lower_static_queue_init_to_tirx",
-    "lower_to_tirx",
-    "lower_to_tirx_module",
-
-    "EventLayout",
-    "KernelLoweringPlan",
+    "lower",
     "LogicalEdge",
-    "StaticLoweringPlan",
-    "SemanticPlan",
-    "StaticSchedulePlan",
-    "TaskPhase",
-    "TensorBinding",
-    "TileLoweringInfo",
-    "TilePlan",
-    "VarBinding",
-    "build_semantic_plan",
-    "prepare_static_lowering_plan",
-    "validate_semantic_plan",
-    "validate_static_lowering_plan",
+    "logical_edges",
+    "validate_impl",
+    "validate_kernel",
 ]

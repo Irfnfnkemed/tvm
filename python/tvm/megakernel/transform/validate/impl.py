@@ -14,11 +14,43 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-"""Collect read/write tensor regions from generated TileImpl TIRX."""
+"""Validate TileImpl accesses against declared DSL tensor accesses.
+
+Validation performed by this module:
+
+1. Impl tensor binding discovery:
+   - TileImpl attributes that reference tensors from the same KernelSpec are
+     used to bind generated TIRX buffers back to DSL TensorSpecs.
+
+2. Impl access collection:
+   - TileImpl device_init, prefetch, and run hooks are emitted through the TIRX
+     parser.
+   - Buffer loads, stores, block regions, and tile primitive srcs/dsts are
+     collected as actual read/write accesses.
+   - Unknown side effects or regions are recorded so validation can report that
+     coverage cannot be proven.
+
+3. Declared access coverage:
+   - Actual reads must be covered by tile.reads declarations.
+   - Actual writes must be covered by tile.writes declarations.
+   - A bare declared tensor access covers any actual region of that tensor.
+   - Region coverage is checked on deterministic samples for symbolic grids.
+
+4. Validation policy:
+   - impl_access_validate="error" raises on collection or coverage failures.
+   - impl_access_validate="warn" reports recoverable failures as warnings.
+   - impl_access_validate="off" skips TileImpl access validation for that tile.
+"""
 
 from __future__ import annotations
 
+from collections import defaultdict
 from collections.abc import Callable
+from functools import reduce
+from itertools import product
+from operator import mul
+import random
+import warnings
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -29,7 +61,17 @@ from tvm.tirx.expr_functor import ExprVisitor
 from tvm.tirx.stmt_functor import StmtVisitor
 
 from ...dsl.impl import TileImpl
-from ...dsl.spec import RegionRange, RegionSpec, TensorSpec, expr_bounds
+from ...dsl.spec import (
+    ExprSpec,
+    KernelSpec,
+    RegionRange,
+    RegionSpec,
+    TensorSpec,
+    VarSpec,
+    eval_expr_like,
+    expr_bounds,
+    expr_vars,
+)
 
 
 @dataclass(frozen=True)
@@ -63,6 +105,354 @@ class ImplAccess:
         self.reads.extend(other.reads)
         self.writes.extend(other.writes)
         self.unknown_effects.extend(other.unknown_effects)
+
+
+def validate_impl(kernel: KernelSpec) -> None:
+    """Validate generated TileImpl accesses against declared tile accesses."""
+
+    tensor_ids = {id(tensor) for tensor in kernel.tensors.values()}
+    envs = _sample_kernel_envs(kernel)
+    for tile in kernel.tiles:
+        policy = tile.attrs.get("impl_access_validate", "error")
+        if policy not in ("error", "warn", "off"):
+            raise ValueError(
+                f"tile {tile.name!r} has unsupported impl_access_validate policy {policy!r}"
+            )
+        if policy == "off":
+            continue
+        impl_tensors = _tile_impl_tensor_attrs(tile, tensor_ids)
+        if not impl_tensors:
+            continue
+        for env in envs:
+            patches = _patch_impl_expr_attrs(tile.impl, env)
+            try:
+                actual = collect_impl_access(tile.impl, tensors=impl_tensors, hooks=("prefetch", "run"))
+            except Exception as err:
+                _handle_impl_access_issue(
+                    tile,
+                    policy,
+                    f"impl access collection failed: {err}",
+                    force_error=True,
+                    cause=err,
+                )
+                continue
+            finally:
+                _restore_impl_attrs(tile.impl, patches)
+            for effect in actual.unknown_effects:
+                warnings.warn(
+                    f"tile {tile.name!r} impl has unknown access effect: {effect}",
+                    stacklevel=2,
+                )
+            _validate_actual_accesses(tile, actual.reads, tile.reads, "read", [env], policy)
+            _validate_actual_accesses(tile, actual.writes, tile.writes, "write", [env], policy)
+
+
+def _handle_impl_access_issue(
+    tile,
+    policy: str,
+    message: str,
+    *,
+    force_error: bool = False,
+    cause: BaseException | None = None,
+) -> None:
+    full_message = f"tile {tile.name!r} {message}"
+    if force_error or policy == "error":
+        raise ValueError(full_message) from cause
+    warnings.warn(full_message, stacklevel=3)
+
+
+def _tile_impl_tensor_attrs(tile, tensor_ids: set[int]) -> dict[str, TensorSpec]:
+    result: dict[str, TensorSpec] = {}
+    for attr_name, value in vars(tile.impl).items():
+        if isinstance(value, TensorSpec) and id(value.base_tensor) in tensor_ids:
+            result[attr_name] = value.base_tensor
+    return result
+
+
+def _patch_impl_expr_attrs(impl: TileImpl, env: dict[VarSpec, int] | None):
+    patches = []
+    for attr_name, value in vars(impl).items():
+        new_value = _resolve_impl_expr_refs(value, env)
+        if new_value is not value:
+            patches.append((attr_name, value))
+            setattr(impl, attr_name, new_value)
+    return patches
+
+
+def _restore_impl_attrs(impl: TileImpl, patches) -> None:
+    for attr_name, value in reversed(patches):
+        setattr(impl, attr_name, value)
+
+
+def _resolve_impl_expr_refs(value: Any, env: dict[VarSpec, int] | None):
+    if isinstance(value, (VarSpec, ExprSpec)):
+        resolved = eval_expr_like(value, env)
+        if resolved is None:
+            return value
+        return resolved
+    if isinstance(value, tuple):
+        resolved = tuple(_resolve_impl_expr_refs(item, env) for item in value)
+        return value if resolved == value else resolved
+    if isinstance(value, list):
+        resolved = [_resolve_impl_expr_refs(item, env) for item in value]
+        return value if resolved == value else resolved
+    if isinstance(value, dict):
+        resolved = {
+            _resolve_impl_expr_refs(key, env): _resolve_impl_expr_refs(val, env)
+            for key, val in value.items()
+        }
+        return value if resolved == value else resolved
+    return value
+
+
+def _validate_actual_accesses(tile, actual_accesses, declared_accesses, kind: str, envs, policy: str) -> None:
+    declared_by_tensor: dict[TensorSpec, list[TensorSpec]] = defaultdict(list)
+    for access in declared_accesses:
+        declared_by_tensor[access.base_tensor].append(access)
+
+    for actual in actual_accesses:
+        tensor = actual.tensor.base_tensor
+        candidates = declared_by_tensor.get(tensor, [])
+        if not candidates:
+            _handle_impl_access_issue(
+                tile,
+                policy,
+                f"impl {kind}s tensor {tensor.name!r} but tile.{kind}s does not declare it",
+            )
+            continue
+        if any(declared.region_from_tile is None for declared in candidates):
+            continue
+        if actual.tensor.region_from_tile is None:
+            _handle_impl_access_issue(
+                tile,
+                policy,
+                f"impl {kind}s tensor {tensor.name!r} with unknown region; "
+                "cannot prove declared region coverage",
+            )
+            continue
+        for env in envs:
+            tile_extents = _static_int_tuple(tile.grid, env)
+            if tile_extents is None:
+                continue
+            for idx in product(*(range(extent) for extent in tile_extents)):
+                actual_region = _region_from_access(actual.tensor, env, *idx)
+                declared_regions = [
+                    _region_from_access(declared, env, *idx) for declared in candidates
+                ]
+                if _region_set_covers(declared_regions, actual_region):
+                    continue
+                _handle_impl_access_issue(
+                    tile,
+                    policy,
+                    f"impl {kind}s tensor {tensor.name!r} region "
+                    f"{_region_label(actual_region)} outside declared tile.{kind}s regions",
+                )
+                break
+
+
+def _region_set_covers(
+    outers: list[RegionSpec | None] | tuple[RegionSpec | None, ...],
+    inner: RegionSpec | None,
+) -> bool:
+    if any(outer is None for outer in outers):
+        return True
+    if inner is None:
+        return False
+    if not outers:
+        return False
+    if any(_region_contains(outer, inner) for outer in outers):
+        return True
+    if not _static_region(inner):
+        return False
+    for point in _region_points(inner):
+        point_region = RegionSpec(
+            dims=tuple(RegionRange(start=value, extent=1) for value in point)
+        )
+        if not any(_region_contains(outer, point_region) for outer in outers):
+            return False
+    return True
+
+
+def _region_contains(outer: RegionSpec | None, inner: RegionSpec | None) -> bool:
+    if outer is None:
+        return True
+    if inner is None:
+        return False
+    if len(outer.dims) != len(inner.dims):
+        return False
+    for outer_dim, inner_dim in zip(outer.dims, inner.dims):
+        if not all(
+            isinstance(value, int) and not isinstance(value, bool)
+            for value in (outer_dim.start, outer_dim.extent, inner_dim.start, inner_dim.extent)
+        ):
+            return False
+        outer_end = outer_dim.start + outer_dim.extent
+        inner_end = inner_dim.start + inner_dim.extent
+        if inner_dim.start < outer_dim.start or inner_end > outer_end:
+            return False
+    return True
+
+
+def _static_region(region: RegionSpec | None) -> bool:
+    if region is None:
+        return False
+    return all(
+        isinstance(value, int) and not isinstance(value, bool)
+        for dim in region.dims
+        for value in (dim.start, dim.extent)
+    )
+
+
+def _region_points(region: RegionSpec):
+    return product(*(range(dim.start, dim.start + dim.extent) for dim in region.dims))
+
+
+def _region_from_access(access: TensorSpec, env, m_idx, n_idx, k_idx) -> RegionSpec | None:
+    if access.region_from_tile is None:
+        return None
+    return _resolve_region(_region_from_tile(access.region_from_tile, m_idx, n_idx, k_idx), env)
+
+
+def _region_from_tile(region_from_tile, m_idx, n_idx, k_idx) -> RegionSpec:
+    region = region_from_tile(m_idx, n_idx, k_idx) if callable(region_from_tile) else region_from_tile
+    if isinstance(region, RegionSpec):
+        return region
+    if isinstance(region, (tuple, list)):
+        return RegionSpec(dims=tuple(RegionRange(value, 1) for value in region))
+    raise TypeError(f"region_from_tile must return RegionSpec, tuple, or list, got {region!r}")
+
+
+def _resolve_region(region: RegionSpec | None, env: dict[VarSpec, int] | None) -> RegionSpec | None:
+    if region is None:
+        return None
+    return RegionSpec(
+        dims=tuple(
+            RegionRange(
+                start=_resolve_expr_value(dim.start, env),
+                extent=_resolve_expr_value(dim.extent, env),
+            )
+            for dim in region.dims
+        )
+    )
+
+
+def _region_label(region: RegionSpec | None) -> str:
+    if region is None:
+        return "unknown"
+    parts = []
+    for dim in region.dims:
+        if dim.extent == 1:
+            parts.append(str(dim.start))
+        else:
+            parts.append(f"{dim.start}:{dim.start + dim.extent}")
+    return "[" + ", ".join(parts) + "]"
+
+
+def _collect_kernel_vars(kernel: KernelSpec) -> list[VarSpec]:
+    seen: set[VarSpec] = set()
+    result: list[VarSpec] = []
+
+    def add_from(value: Any) -> None:
+        for var in expr_vars(value):
+            if var not in seen:
+                seen.add(var)
+                result.append(var)
+
+    for var in kernel.vars.values():
+        add_from(var)
+    for tensor in kernel.tensors.values():
+        add_from(tensor.shape)
+    for event in kernel.events.values():
+        add_from(event.shape)
+    for tile in kernel.tiles:
+        add_from(tile.grid)
+    return result
+
+
+def _sample_kernel_envs(kernel: KernelSpec) -> list[dict[VarSpec, int] | None]:
+    vars_seen = list(_collect_kernel_vars(kernel))
+    if not vars_seen:
+        return [None]
+
+    rng = random.Random(0)
+    candidates = []
+    for base in (1, 2, 4, 8, 16):
+        candidates.append(dict(_sample_value_for_base(var, base) for var in vars_seen))
+    bounded_values = [_range_sample_values(var) for var in vars_seen]
+    if all(values is not None for values in bounded_values):
+        for values in zip(*bounded_values):
+            candidates.append(dict(zip(vars_seen, values)))
+    for _ in range(5):
+        candidates.append({var: _random_sample_value(var, rng) for var in vars_seen})
+
+    unique = []
+    seen = set()
+    for env in candidates:
+        key = tuple((var.name, env[var]) for var in vars_seen)
+        if key not in seen:
+            seen.add(key)
+            unique.append(env)
+    return [env for env in unique if _kernel_sample_fits_budget(kernel, env)]
+
+
+def _kernel_sample_fits_budget(kernel: KernelSpec, env: dict[VarSpec, int]) -> bool:
+    budget = 65536
+    total = 0
+    for tensor in kernel.tensors.values():
+        total += _extent_product(_static_int_tuple(tensor.shape, env))
+    for event in kernel.events.values():
+        total += _extent_product(_static_int_tuple(event.shape, env))
+    for tile in kernel.tiles:
+        total += _extent_product(_static_int_tuple(tile.grid, env))
+    return total <= budget
+
+
+def _shape_tuple(shape: Any) -> tuple[Any, ...]:
+    return tuple(shape) if isinstance(shape, (tuple, list)) else (shape,)
+
+
+def _static_int_tuple(values: Any, env: dict[VarSpec, int] | None = None) -> tuple[int, ...] | None:
+    result = []
+    for value in _shape_tuple(values):
+        resolved = eval_expr_like(value, env)
+        if resolved is None:
+            return None
+        result.append(resolved)
+    return tuple(result)
+
+
+def _sample_value_for_base(var: VarSpec, base: int) -> tuple[VarSpec, int]:
+    if var.bounds is None:
+        return var, base
+    lo, hi = var.bounds
+    return var, min(max(base, lo), hi)
+
+
+def _range_sample_values(var: VarSpec) -> tuple[int, ...] | None:
+    if var.bounds is None:
+        return None
+    lo, hi = var.bounds
+    mid = (lo + hi) // 2
+    return tuple(dict.fromkeys((lo, mid, hi)))
+
+
+def _random_sample_value(var: VarSpec, rng: random.Random) -> int:
+    if var.bounds is None:
+        return rng.randint(1, 16)
+    lo, hi = var.bounds
+    return rng.randint(lo, hi)
+
+
+def _extent_product(extents: tuple[int, ...] | None) -> int:
+    if extents is None:
+        return 0
+    return reduce(mul, extents, 1)
+
+
+def _resolve_expr_value(value: Any, env: dict[VarSpec, int] | None) -> Any:
+    resolved = eval_expr_like(value, env)
+    return value if resolved is None else resolved
+
 
 
 class _AccessCollector(StmtVisitor):
@@ -360,6 +750,8 @@ def _full_region(buffer: Buffer) -> BufferRegion:
     return BufferRegion(buffer, [Range.from_min_extent(0, extent) for extent in buffer.shape])
 
 
+
+
 def _is_compose_op(op: TilePrimitiveCall) -> bool:
     return str(getattr(op, "op", "")).endswith("compose_op")
 
@@ -381,4 +773,4 @@ def _expr_has_unknown_side_effect(expr: Any) -> bool:
     return "call_packed" in op_name
 
 
-__all__ = ["Access", "ImplAccess", "collect_impl_access"]
+__all__ = ["Access", "ImplAccess", "collect_impl_access", "validate_impl"]

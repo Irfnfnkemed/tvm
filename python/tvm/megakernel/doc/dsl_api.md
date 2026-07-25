@@ -1,496 +1,305 @@
 # Megakernel DSL User API
 
-This document lists the user-facing API in `tvm.megakernel.dsl`.
-
-## Public Entry Points
-
-The top-level `tvm.megakernel.dsl` module exposes the user entry points only:
+This document describes the public API exposed from `tvm.megakernel.dsl`.
+The intended user import is:
 
 ```python
-from tvm.megakernel.dsl import KernelSpec, R, TileImpl, SmemManager
+from tvm.megakernel.dsl import D, KernelSpec, R, TileImpl, SmemManager
 ```
 
-The DSL has two layers:
+The API has two layers:
 
-- Spec layer: `KernelSpec` and `R`.  This layer describes tile stages, tensor
-  inputs/outputs, logical events, and wait/notify dependencies.  Objects such
-  as `TensorSpec`, `EventSpec`, and `TileSpec` are returned by `KernelSpec`
-  builder methods; users should not construct them directly.
-- Impl layer: `TileImpl` and `SmemManager`.  This layer connects a logical tile
-  to the concrete implementation of that tile.
+- Spec layer: `KernelSpec`, `R`, and `D`.  It records tensors, tensor regions,
+  logical events, tile grids, and wait/notify dependencies.
+- Impl layer: `TileImpl` and `SmemManager`.  It provides the local TIRX body for
+  each tile kind.
 
-Internal spec helper types live under `tvm.megakernel.dsl.spec`.  Internal impl
-helper types live under `tvm.megakernel.dsl.impl`.  The top-level module should
-remain a small user API facade.
+`TensorSpec`, `EventSpec`, `TileSpec`, and `DependencySpec` are builder return
+values.  Users may pass them around, but should not construct them directly.
 
-The spec layer corresponds to Step 3 in [workflow.md](workflow.md).  The impl
-layer corresponds to Step 4.
-
-## `KernelSpec`
+## KernelSpec
 
 ```python
 kernel = KernelSpec(name: str, attrs: dict[str, Any] | None = None)
 ```
 
-Creates one megakernel spec.  Symbolic variables, tensors, events, and tiles
-are registered on this object.
+`KernelSpec` owns one megakernel specification.  It registers vars, tensors,
+events, and tile stages.
 
-Parameters:
-
-- `name`: unique name for the megakernel spec.
-- `attrs`: optional metadata reserved for later passes.
-
-Example:
+### Vars
 
 ```python
-kernel = KernelSpec("two_stage_reduce", attrs={"target": "sm90"})
+M = kernel.var("M", dtype="int32", bounds=(1, 4096))
 ```
 
-## `KernelSpec.var`
+Vars are symbolic integer values used in tensor shapes, event shapes, and tile
+grids.  Bounds are optional, but validation can use them when it samples
+symbolic spaces.
+
+### Tensors
 
 ```python
-var = kernel.var(name: str, dtype: str = "int32", bounds: tuple[int, int] | None = None)
+A = kernel.tensor("A", (M, 4096), "float16")
 ```
 
-Registers a symbolic integer variable that can be used in tensor shapes, event
-shapes, and grid shapes.  The current TIRX lowering emits each symbolic
-variable as a local symbolic variable in the PrimFunc body using the `VarSpec`
-dtype, for example `M = T.int32()`, instead of exposing it as a kernel
-parameter.
+A tensor shape may contain integers, vars, or DSL expressions such as
+`M.ceildiv(128)`.
 
-Parameters:
-
-- `name`: symbolic variable name, unique inside the kernel.
-- `dtype`: scalar dtype used by lowering.  Defaults to `"int32"`.
-- `bounds`: optional inclusive `(min, max)` bounds for this symbolic value.  Passes that need static allocation or bounded sampling require this.
-
-Returns: `VarSpec`.
-
-Example:
+A bare tensor in a tile declaration means the accessed region is unknown:
 
 ```python
-M = kernel.var("M", dtype="int32", bounds=(1, 1024))
-A = kernel.tensor("A", shape=(M, 1024), dtype="float32")
+kernel.tile("stage", StageTile(), grid=(M, 1, 1), reads=[A])
 ```
 
-## `KernelSpec.tensor`
+This is equivalent to a dynamic/unknown region.  It is valid, but region-specific
+semantic checks cannot prove bounds or overlap.
+
+### Tensor Regions
 
 ```python
-tensor = kernel.tensor(name: str, shape: ShapeType, dtype: str)
+access = A.region(lambda m, n, k: R[m, 0:128])
 ```
 
-Registers a logical tensor.
+`tensor.region(...)` returns an access view with a known mapping from tile
+coordinate `(m, n, k)` to a tensor region.  Use this when validation should check
+region dimensions, bounds, and producer-consumer overlap.
 
-Parameters:
+`R[...]` is the public region builder.  Indices may be integers, slices, vars,
+DSL expressions, or lower-time expressions.
 
-- `name`: tensor name, unique inside the kernel.
-- `shape`: tensor shape.  Each dimension can be an `int`, `VarSpec`, or a small `VarSpec` expression such as `M + 1` or `M.ceildiv(128)`.
-- `dtype`: tensor element type.
-
-Returns: `TensorSpec`.
-
-Example:
+### Events
 
 ```python
-bs = kernel.var("bs", bounds=(1, 1024))
-A = kernel.tensor("A", shape=(bs, 1024), dtype="float32")
+ready = kernel.event("ready", (M,), init_count=lambda m: 1)
 ```
 
-## `KernelSpec.event`
+An event is a logical count tensor.  `len(shape)` is the number of event
+dimensions.
 
-```python
-event = kernel.event(
-    name: str,
-    shape: ShapeType,
-    init_count: int | Callable[..., int],
-    dtype: str = "int32",
-    attrs: dict[str, Any] | None = None,
-)
-```
+`init_count` is required.  It may be:
 
-Registers a logical event tensor.
-
-Parameters:
-
-- `name`: event name, unique inside the kernel.
-- `shape`: event tensor shape.  Each dimension can be an `int`, `VarSpec`, or a small `VarSpec` expression such as `M + 1` or `M.ceildiv(128)`.
-- `init_count`: logical non-negative count for each event coordinate.  This can be a single
-  integer for a uniform count, or a callable whose arguments are the expanded
-  event coordinate.
-- `dtype`: event storage dtype.  Defaults to `"int32"`.
-- `attrs`: optional metadata reserved for later passes.
-
-Returns: `EventSpec`.
+- an integer, used uniformly for every event coordinate;
+- a callable, called with the expanded event coordinate.
 
 Examples:
 
 ```python
-evt1 = kernel.event(
-    "evt1",
-    shape=(100,),
-    init_count=88,
-)
-
-evt2 = kernel.event(
-    "evt2",
-    shape=(100, 200),
-    init_count=lambda i, j: i + j,
+row_ready = kernel.event("row_ready", (NUM_M,), init_count=lambda m: NUM_N)
+expert_ready = kernel.event(
+    "expert_ready",
+    (NUM_EXPERTS,),
+    init_count=lambda expert: tokens_per_expert(expert),
 )
 ```
 
-## `KernelSpec.tile`
+### Tiles
 
 ```python
 tile = kernel.tile(
-    name: str,
-    impl: TileImpl,
-    grid: GridType,
-    reads: list[TensorSpec] | None = None,
-    writes: list[TensorSpec] | None = None,
-    attrs: dict[str, Any] | None = None,
+    "stage",
+    StageTile(),
+    grid=(M, 1, 1),
+    reads=[A.region(lambda m, n, k: R[m, 0:128])],
+    writes=[B.region(lambda m, n, k: R[m, 0:128])],
+    attrs={"notify_scope": "cta"},
 )
 ```
 
-Registers one logical tile stage.
+The grid is always three-dimensional and follows `(m, n, k)`.  Use `1` for
+unused axes.
 
-Parameters:
+Event-related tile attrs used by lowering include:
 
-- `name`: tile stage name, unique inside the kernel.
-- `impl`: local tile implementation object.
-- `grid`: grid shape on `(m, n, k)` axes.  Use `1` for unused axes.
-- `reads`: tensors or tensor region accesses read by this tile.  Use `tensor.region(...)` when semantic region validation should check the access.
-- `writes`: tensors or tensor region accesses written by this tile.  Use `tensor.region(...)` when semantic region validation should check the access.
-- `attrs`: optional metadata reserved for later passes.
+- `wait_scope`: wait scope, usually `"cta"` or `"warp"`.
+- `wait_mask`: warp mask for warp-level waits.
+- `notify_scope`: scope participating in notify.
+- `notify_scope_id`: concrete scope id, or `-1` for current scope.
+- `push_scope`: dynamic pre-notify/push scope.  Defaults to `notify_scope`.
+- `push_scope_id`: dynamic push scope id.  Defaults to `notify_scope_id`.
+- `push_level`: dynamic queue push granularity: `"thread"`, `"warp"`,
+  `"warpgroup"`, or `"cta"`.
 
-Returns: `TileSpec`.
+## Dependencies: D
 
-Example:
+`TileSpec.wait` and `TileSpec.notify` only accept dependencies built by `D`:
 
 ```python
-bs = kernel.var("bs", bounds=(1, 1024))
-tile_a = kernel.tile(
-    "tile_a",
-    tile_a_impl,
-    grid=(bs, 16, 1),
-    reads=[A.region(lambda m, n, k: R[m, n])],
+tile.notify(D(event, coord))
+tile.wait(D(event, coord, inv_coord=inv_coord))
+```
+
+The forward coordinate function has one shape:
+
+```python
+coord(tile_m, tile_n, tile_k, notify_i) -> (notify_num, remote_rank, *event_coord)
+```
+
+Meaning:
+
+- `notify_i` is the worker index inside the selected notify scope.
+- `notify_num` is the number of participating notify workers.
+- `remote_rank == -1` means local memory.  Non-negative values use the remote
+  atomic path during lowering.
+- `event_coord` must have the same number of values as the event has
+  dimensions.
+
+For a notify, lowering calls `coord(m, n, k, notify_i)` for workers in the
+selected notify scope and notifies when `notify_i < notify_num`.
+
+For a wait, lowering calls `coord(m, n, k, 0)` and waits on `event_coord`.  A
+wait must describe exactly one local event coordinate:
+
+```text
+notify_num == 1
+remote_rank == -1
+```
+
+## Dynamic inv_coord
+
+Dynamic scheduling uses a reverse mapping to push consumers after producer
+pre-notify:
+
+```python
+inv_coord(remote_rank, *event_coord, consumer_i) -> (consumer_num, tile_m, tile_n, tile_k)
+```
+
+Meaning:
+
+- `consumer_i` is the fan-out index from one ready event coordinate to one
+  consumer tile.
+- `consumer_num` is the total number of consumer tiles for this event
+  coordinate.
+- Lowering reads `consumer_num` from `consumer_i == 0`, then calls `inv_coord`
+  for every consumer index to push concrete tasks.
+- For statically checkable dependencies, every generated consumer tile coord
+  must map back to the original event coord through the wait `coord`, must be
+  inside the consumer tile grid, and must not duplicate another consumer tile
+  from the same event coord.
+
+Static scheduling may omit `inv_coord`.  Dynamic scheduling requires `inv_coord`
+for waits that can be triggered by producer notifies.
+
+## Dependency Examples
+
+Many-to-one reduction:
+
+```python
+row_ready = kernel.event("row_ready", (NUM_M,), init_count=lambda m: NUM_N)
+
+partial = kernel.tile(
+    "partial",
+    PartialTile(),
+    grid=(NUM_M, NUM_N, 1),
     writes=[B.region(lambda m, n, k: R[m, n])],
-)
+).notify(D(row_ready, lambda m, n, k, i: (1, -1, m)))
+
+final = kernel.tile(
+    "final",
+    FinalTile(),
+    grid=(NUM_M, 1, 1),
+    reads=[B.region(lambda m, n, k: R[m, 0:NUM_N])],
+).wait(D(
+    row_ready,
+    lambda m, n, k, i: (1, -1, m),
+    inv_coord=lambda remote_rank, m, consumer_i: (1, m, 0, 0),
+))
 ```
 
-## `TileSpec.wait`
+One event coordinate pushing multiple consumers:
 
 ```python
-tile.wait(
-    event: EventSpec,
-    coord: CoordMapType,
-    inverse_coord: CoordMapType | None = None,
-)
+expert.wait(D(
+    expert_ready,
+    lambda m, n, k, i: (1, -1, expert_for_tile(m)),
+    inv_coord=lambda remote_rank, expert_id, consumer_i: (
+        tokens_per_expert(expert_id),
+        token_for_expert(expert_id, consumer_i),
+        expert_id,
+        0,
+    ),
+))
 ```
 
-Declares that this tile waits on `event` at the coordinate produced by
-`coord`.
-
-Parameters:
-
-- `event`: event to wait on.
-- `coord`: callable mapping tile index `(m, n, k)` to an event
-  coordinate.  If it is a tuple/list instead of a callable, it is used directly
-  as the event coordinate.
-- `inverse_coord`: optional inverse mapping from event coordinate to
-  consumer tile index.  Dynamic scheduling requires this for every wait; static
-  scheduling does not.
-
-Returns: `TileSpec`.
-
-Example:
+Runtime routing tensors may appear in dependency coordinate closures:
 
 ```python
-tile_b.wait(
-    event=evt1,
-    coord=lambda m, n, k: (m,),
-)
+routing = kernel.tensor("routing", (MAX_TOKENS,), "int32")
+producer.notify(D(evt, lambda m, n, k, i: (1, -1, routing[i])))
 ```
 
-## `TileSpec.notify`
+This is intended for MegaMoE-style runtime routing.  Semantic validation cannot
+prove all dimension and round-trip properties for runtime tensor indexing, so it
+skips those static checks with warnings.  Lowering binds the captured
+`TensorSpec` to the corresponding TIRX buffer.
+
+Do not capture `TensorSpec` through default arguments or globals:
 
 ```python
-tile.notify(event: EventSpec, coord: CoordMapType)
+# Avoid this.
+producer.notify(D(evt, lambda m, n, k, i, routing=routing: (1, -1, routing[i])))
 ```
 
-Declares that this tile notifies `event` at the coordinate produced by
-`coord`.
+## TileImpl
 
-Parameters:
-
-- `event`: event to notify.
-- `coord`: callable mapping tile index `(m, n, k)` to an event
-  coordinate.  If it is a tuple/list instead of a callable, it is used directly
-  as the event coordinate.
-
-Returns: `TileSpec`.
-
-Example:
-
-```python
-tile_a.notify(
-    event=evt1,
-    coord=lambda m, n, k: (m,),
-)
-```
-
-## `SmemManager`
-
-If a tile implementation uses shared memory, it should access shared memory
-through `SmemManager`.  The manager is the user-facing boundary between tile
-implementation code and the later megakernel lowering pass.
-
-At the DSL level, `SmemManager` has two responsibilities:
-
-- Allocate logical shared-memory buffers and record their metadata.
-- Emit coarse shared-memory phase operations.
-
-It does not expose physical pages, chunks, or concrete mbarrier operations to
-users.  The current lowering maps the coarse phase operations onto chunk-level
-mbarriers internally.
-
-### `SmemManager.__init__`
-
-```python
-smem_manager = SmemManager(smem_max_bytes, chunk_size)
-```
-
-Creates a manager for one shared-memory pool.
-
-Parameters:
-
-- `smem_max_bytes`: total shared-memory bytes reserved for this manager.
-- `chunk_size`: chunk granularity used by the later lowering implementation.
-
-Users should treat `chunk_size` as a manager configuration, not as a physical
-page API.  Tile code should still synchronize through phase markers rather than
-addressing chunks directly.
-
-### `SmemManager.alloc`
-
-```python
-buf = smem_manager.alloc(
-    shape,
-    dtype="float32",
-    strides=None,
-    scope="shared.dyn",
-    align=0,
-    buffer_type="",
-    axis_separators=None,
-    layout="default",
-    policy="shared",
-)
-```
-
-Allocates one logical shared-memory buffer from the managed pool.  The returned
-buffer can be used directly by parser-style TIRX code in `TileImpl.run()`.  The
-manager also records the allocation so the lowering pass can decide the final
-physical shared-memory layout.
-
-`policy` describes the intended lifetime and reuse behavior:
-
-- `"shared"`: default.  The buffer participates in coarse shared-memory phases
-  marked by `wait_all()` and `release_all()`.
-- `"persistent"`: the buffer is live for the whole megakernel and is not
-  intended to participate in phase-based reuse.  This is useful for long-lived
-  runtime state such as barriers or counters.
-- `"exclusive"`: the buffer asks lowering to avoid physical overlap with other
-  concurrently live buffers.  This is reserved for expert implementations; the
-  first DSL version does not infer fine-grained synchronization correctness.
-
-### `SmemManager.commit`
-
-```python
-smem_manager.commit()
-```
-
-Finalizes the underlying shared-memory pool size annotation after all managed
-allocations have been declared.  In normal DSL usage this should be called by
-the lowering flow, not manually inside the tile computation body.
-
-### `SmemManager.wait_all`
-
-```python
-smem_manager.wait_all(level="cta")
-```
-
-Begins a coarse shared-memory phase.  Managed shared-memory buffers used after
-this call and before the matching `release_all()` are treated as live in the
-same phase.
-
-The current TIRX lowering implements this by waiting on every managed
-shared-memory chunk mbarrier at CTA scope.  Only `level="cta"` is supported for
-now; users do not address chunks directly.
-
-Any tile that allocates non-persistent managed shared memory must call
-`wait_all()` before using that memory and `release_all()` after it is no longer
-needed.  The lowering rejects such tiles if either call is missing.
-
-### `SmemManager.release_all`
-
-```python
-smem_manager.release_all(level="cta")
-```
-
-Ends the current coarse shared-memory phase.  The current TIRX lowering emits
-a chunk-level mbarrier arrive for the managed chunks at CTA scope.  Only
-`level="cta"` is supported for now.
-
-### `SmemManager.advance`
-
-```python
-smem_manager.advance()
-```
-
-Advances the logical shared-memory phase.  In the current TIRX lowering this
-flips the manager's local mbarrier phase bit.  Tile implementations should call
-this after releasing a phase when they intend later work to acquire the next
-phase.
-
-## `TileImpl`
-
-Users subclass `TileImpl` to define the local implementation for one tile kind.
-Only `run()` is required.
+Users subclass `TileImpl` for local parser-style TIRX code.  Only `run()` is
+required.
 
 ```python
 class MyTile(TileImpl):
-    def _declare_resources(self, smem_manager):
-        self.smem = smem_manager.alloc(...)
-
-    @T.inline
-    def device_init(self, smem_manager, m_idx, n_idx, k_idx):
-        self._declare_resources(smem_manager)
-        ...
-
     @T.inline
     def run(self, m_idx, n_idx, k_idx):
         ...
 ```
 
-### `TileImpl.init_shared_resources`
+Optional hooks:
+
+- `init_shared_resources(cls, smem_manager)`: class-level setup emitted before
+  dispatch.
+- `finalize_shared_resources(cls, smem_manager)`: class-level cleanup emitted
+  after dispatch.
+- `device_init(self, smem_manager, m_idx, n_idx, k_idx)`: per-task setup.
+- `host_init(self)`: host-side setup.
+- `prefetch(self, m_idx, n_idx, k_idx)`: prefetch before waits.
+- `run(self, m_idx, n_idx, k_idx)`: required tile body.
+
+Global dependency policy should not be hand-written inside `TileImpl`; it belongs
+in `wait(D(...))` and `notify(D(...))`.
+
+## SmemManager
+
+`SmemManager` is the user boundary for managed shared memory:
 
 ```python
-@classmethod
-@T.inline
-def init_shared_resources(cls, smem_manager): ...
+buf = smem_manager.alloc(shape, dtype="float32", policy="shared")
+smem_manager.wait_all(level="cta")
+...
+smem_manager.release_all(level="cta")
+smem_manager.advance()
 ```
 
-Optional.  Emits parser-style initialization for resources shared by all
-instances of this tile class.  Class-level resource declaration or
-handle-recording logic can live in ordinary Python helpers called from this
-hook.
+Policies:
 
-Example:
+- `"shared"`: participates in phase-based reuse.
+- `"persistent"`: live for the whole megakernel.
+- `"exclusive"`: requests no physical overlap with other concurrently live
+  buffers.
+
+Lowering maps these coarse operations to physical shared-memory layout and
+chunk-level mbarriers.  Users should not address physical chunks directly.
+
+## Lowering
 
 ```python
-@classmethod
-def _declare_class_resources(cls, smem_manager):
-    cls.accum = smem_manager.alloc(...)
+from tvm.megakernel.transform import LoweringOptions, lower
 
-@classmethod
-@T.inline
-def init_shared_resources(cls, smem_manager):
-    cls._declare_class_resources(smem_manager)
-    warp_id = T.warp_id([...])
-    if warp_id == 0:
-        T.ptx.tcgen05.alloc(...)
+mod = lower(kernel, LoweringOptions(schedule="static"))
+mod = lower(kernel, LoweringOptions(schedule="dynamic", attrs={"num_threads": 256}))
 ```
 
-### `TileImpl.finalize_shared_resources`
+`lower()` validates the DSL graph, validates `TileImpl` accesses, prepares a
+lowering plan, validates that plan, and emits a TIRX module.
 
-```python
-@classmethod
-@T.inline
-def finalize_shared_resources(cls, smem_manager): ...
-```
-
-Optional.  Emits parser-style finalization for resources initialized by
-`init_shared_resources()`.
-
-Example:
-
-```python
-@classmethod
-@T.inline
-def finalize_shared_resources(cls, smem_manager):
-    warp_id = T.warp_id([...])
-    T.tvm_storage_sync("shared")
-    if warp_id == 0:
-        T.ptx.tcgen05.relinquish_alloc_permit(...)
-        T.ptx.tcgen05.dealloc(...)
-```
-
-### `TileImpl.device_init`
-
-```python
-@T.inline
-def device_init(self, smem_manager, m_idx, n_idx, k_idx): ...
-```
-
-Optional.  Emits parser-style device initialization for one tile instance.
-Use this hook for TIRX statements that must appear in the final kernel body.
-Resource declaration or handle-recording logic can live in ordinary Python
-helpers called from this hook; those helpers do not need to be part of the
-public `TileImpl` API.
-
-### `TileImpl.host_init`
-
-```python
-def host_init(self): ...
-```
-
-Optional.  Initializes host-side state for one tile instance.  For example,
-this hook can set the cuTensorMap used by that tile instance.
-
-Example:
-
-```python
-def host_init(self):
-    T.call_packed("runtime.cuTensorMapEncodeTiled", ...)
-```
-
-### `TileImpl.prefetch`
-
-```python
-@T.inline
-def prefetch(self, m_idx, n_idx, k_idx): ...
-```
-
-Optional.  Prefetches data for one tile instance before `run()`.  This hook
-may run before the tile dependency is satisfied, after the tile has been
-dispatched to an SM.  For example, it can prefetch weights that do not depend
-on activations while previous tasks are still incomplete.
-
-### `TileImpl.run`
-
-```python
-@T.inline
-def run(self, m_idx, n_idx, k_idx): ...
-```
-
-Required.  Defines the computation for one logical tile instance at index
-`(m_idx, n_idx, k_idx)`.
-
-## DSL Example
-
-```python
-stage1 = kernel.tile(
-    "stage1",
-    Stage1Tile(),
-    grid=(NUM_BLOCK_M, NUM_BLOCK_N, 1),
-    reads=[A.region(lambda m, n, k: R[m, n])],
-    writes=[B.region(lambda m, n, k: R[m, n])],
-).notify(row_ready, lambda m, n, k: (m,))
-
-stage2 = kernel.tile(
-    "stage2",
-    Stage2Tile(),
-    grid=(NUM_BLOCK_M, 1, 1),
-    reads=[B.region(lambda m, n, k: R[m, 0:NUM_BLOCK_N])],
-    writes=[C.region(lambda m, n, k: R[m])],
-).wait(row_ready, lambda m, n, k: (m,), inverse_coord=lambda m: (m, 0, 0))
-```
+Dynamic lowering follows the old PR-style megakernel runtime model: queue-init
+pushes entry tasks, a scheduler warp dequeues tasks with mbarriers, producer
+pre-notify pushes newly ready consumers through `inv_coord`, and complete-notify
+finishes the event after `run()`.

@@ -18,9 +18,10 @@
 """Megakernel DSL user API."""
 
 from .impl import SmemManager, TileImpl
-from .spec import KernelSpec, R
+from .spec import D, KernelSpec, R
 
 __all__ = [
+    "D",
     "KernelSpec",
     "R",
     "SmemManager",

@@ -14,7 +14,7 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-"""Prepare lower-private state from semantic megakernel plans."""
+"""Prepare lower-private state from megakernel specs."""
 
 from __future__ import annotations
 
@@ -31,8 +31,8 @@ from ...dsl.spec import (
     TileSpec,
     VarSpec,
     expr_bounds,
+    expr_vars,
 )
-from ..semantic import SemanticPlan
 
 INIT_EVENT_JOB_ID = 29
 WAIT_EVENT_INIT_JOB_ID = 30
@@ -47,7 +47,6 @@ class LoweringOptions:
     smem_max_bytes: int = 228 * 1024
     smem_chunk_size: int = 16 * 1024
     schedule: str = "static"
-    emit_event_markers: bool = True
     emit_smem_markers: bool = True
     attrs: dict[str, Any] = field(default_factory=dict)
 
@@ -152,7 +151,7 @@ class DynamicTrigger:
     producer: TilePlan
     consumer: TilePlan
     consumer_coord: Any
-    consumer_inverse_coord: Any | None
+    consumer_inv_coord: Any | None
 
 
 @dataclass(frozen=True)
@@ -184,7 +183,7 @@ class DynamicSchedulePlan:
                         "event": trigger.event.name,
                         "producer": trigger.producer.tile.name,
                         "consumer": trigger.consumer.tile.name,
-                        "has_inverse_coord": trigger.consumer_inverse_coord is not None,
+                        "has_inv_coord": trigger.consumer_inv_coord is not None,
                     }
                     for trigger in triggers
                 ]
@@ -198,7 +197,7 @@ class DynamicSchedulePlan:
 class LoweringPlan:
     """Prepared lower-private plan used by the default TIRX emitter."""
 
-    semantic: SemanticPlan
+    kernel: KernelSpec
     options: LoweringOptions
     var_order: list[VarSpec] = field(default_factory=list)
     var_bindings: dict[VarSpec, VarBinding] = field(default_factory=dict)
@@ -216,10 +215,6 @@ class LoweringPlan:
     smem_manager: Any | None = None
     event_bindings: dict[str, Any] = field(default_factory=dict)
     event_init_complete: Any | None = None
-
-    @property
-    def kernel(self) -> KernelSpec:
-        return self.semantic.kernel
 
 
     def normalized_data(self) -> dict[str, Any]:
@@ -288,12 +283,10 @@ def _data_value(value: Any) -> Any:
     return value
 
 
-def prepare_lowering_plan(
-    semantic: SemanticPlan, options: LoweringOptions
-) -> LoweringPlan:
+def prepare_lowering_plan(kernel: KernelSpec, options: LoweringOptions) -> LoweringPlan:
     """Create the lower-private plan for the selected schedule."""
 
-    plan = LoweringPlan(semantic=semantic, options=options)
+    plan = LoweringPlan(kernel=kernel, options=options)
     _bind_vars(plan)
     _bind_tensors(plan)
     _bind_tiles(plan)
@@ -393,9 +386,31 @@ def upper_bound_shape_product(
     return result
 
 
+
+def _collect_kernel_vars(kernel: KernelSpec) -> list[VarSpec]:
+    seen: set[VarSpec] = set()
+    result: list[VarSpec] = []
+
+    def add_from(value: Any) -> None:
+        for var in expr_vars(value):
+            if var not in seen:
+                seen.add(var)
+                result.append(var)
+
+    for var in kernel.vars.values():
+        add_from(var)
+    for tensor in kernel.tensors.values():
+        add_from(tensor.shape)
+    for event in kernel.events.values():
+        add_from(event.shape)
+    for tile in kernel.tiles:
+        add_from(tile.grid)
+    return result
+
+
 def _bind_vars(plan: LoweringPlan) -> None:
     used_names: set[str] = set()
-    for var in plan.semantic.vars:
+    for var in _collect_kernel_vars(plan.kernel):
         param_name = _sanitize_identifier(var.name, used_names)
         plan.var_order.append(var)
         plan.var_bindings[var] = VarBinding(var=var, param_name=param_name)
@@ -403,14 +418,14 @@ def _bind_vars(plan: LoweringPlan) -> None:
 
 def _bind_tensors(plan: LoweringPlan) -> None:
     used_names: set[str] = set()
-    for tensor in plan.semantic.tensors:
+    for tensor in plan.kernel.tensors.values():
         param_name = _sanitize_identifier(tensor.name, used_names)
         plan.tensor_order.append(tensor)
         plan.tensor_bindings[tensor] = TensorBinding(tensor=tensor, param_name=param_name)
 
 
 def _bind_tiles(plan: LoweringPlan) -> None:
-    for job_id, tile in enumerate(plan.semantic.tiles):
+    for job_id, tile in enumerate(plan.kernel.tiles):
         info = TileLoweringInfo(tile=tile, job_id=job_id, class_key=type(tile.impl))
         tensor_bindings = {}
         for access in [*tile.reads, *tile.writes]:
@@ -424,7 +439,7 @@ def _bind_tiles(plan: LoweringPlan) -> None:
 
 def _build_event_layouts(plan: LoweringPlan) -> None:
     offset: Any = 0
-    for event in plan.semantic.events:
+    for event in plan.kernel.events.values():
         size = upper_bound_shape_product(
             event.shape, f"event {event.name!r} shape", require_bounded=True
         )
@@ -520,7 +535,7 @@ def _build_dynamic_schedule_plan(plan: LoweringPlan) -> None:
         producer_triggers: list[DynamicTrigger] = []
         for notify_dep in producer.notifies:
             notify_event = notify_dep.event
-            for consumer_tile in plan.semantic.tiles:
+            for consumer_tile in plan.kernel.tiles:
                 for wait_dep in consumer_tile.waits:
                     wait_event = wait_dep.event
                     if wait_event is not notify_event:
@@ -531,7 +546,7 @@ def _build_dynamic_schedule_plan(plan: LoweringPlan) -> None:
                             producer=producer,
                             consumer=tile_plan_by_tile[id(consumer_tile)],
                             consumer_coord=wait_dep.coord,
-                            consumer_inverse_coord=wait_dep.inverse_coord,
+                            consumer_inv_coord=wait_dep.inv_coord,
                         )
                     )
         if producer_triggers:
@@ -568,6 +583,45 @@ def _sanitize_identifier(name: str, used_names: set[str]) -> str:
     return candidate
 
 
+def replace_dsl_refs(
+    value: Any,
+    tensor_bindings: dict[TensorSpec, TensorBinding],
+    plan: LoweringPlan | None = None,
+    *,
+    expr_mode: str = "runtime",
+) -> Any:
+    """Replace DSL objects captured by TileImpl attributes with lowering-time objects."""
+
+    if isinstance(value, TensorSpec):
+        tensor = value.base_tensor
+        if tensor in tensor_bindings:
+            return tensor_bindings[tensor].buffer
+        return value
+    if isinstance(value, (VarSpec, ExprSpec)):
+        if expr_mode == "upper_bound":
+            bounds = expr_bounds(value, require_bounded=True)
+            if bounds is None:
+                raise ValueError(f"TileImpl captured expression {value!r} is not bounded")
+            return bounds[1]
+        if expr_mode == "runtime":
+            return lower_expr_like(value, "TileImpl captured DSL expression", plan)
+        raise ValueError(f"unsupported DSL expression replacement mode {expr_mode!r}")
+    if isinstance(value, tuple):
+        return tuple(
+            replace_dsl_refs(item, tensor_bindings, plan, expr_mode=expr_mode) for item in value
+        )
+    if isinstance(value, list):
+        return [replace_dsl_refs(item, tensor_bindings, plan, expr_mode=expr_mode) for item in value]
+    if isinstance(value, dict):
+        return {
+            replace_dsl_refs(key, tensor_bindings, plan, expr_mode=expr_mode): replace_dsl_refs(
+                val, tensor_bindings, plan, expr_mode=expr_mode
+            )
+            for key, val in value.items()
+        }
+    return value
+
+
 def replace_tensor_specs(value: Any, bindings: dict[TensorSpec, TensorBinding]) -> Any:
     """Replace TensorSpec references with their lowered TIRX buffers."""
 
@@ -575,6 +629,7 @@ def replace_tensor_specs(value: Any, bindings: dict[TensorSpec, TensorBinding]) 
         tensor = value.base_tensor
         if tensor in bindings:
             return bindings[tensor].buffer
+        return value
     if isinstance(value, tuple):
         return tuple(replace_tensor_specs(item, bindings) for item in value)
     if isinstance(value, list):
@@ -617,6 +672,7 @@ __all__ = [
     "prepare_static_lowering_plan",
     "raw_shape_product",
     "upper_bound_shape_product",
+    "replace_dsl_refs",
     "replace_tensor_specs",
     "shape_product",
     "shape_tuple",

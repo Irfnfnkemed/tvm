@@ -14,184 +14,207 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-"""Semantic validation for megakernel DSL graphs."""
+"""Semantic validation for megakernel DSL graphs.
+
+Validation performed by this module, in call order:
+
+1. Kernel declaration ownership:
+   - Tensor shapes, event shapes, and tile grids may only reference Vars owned
+     by the same KernelSpec.
+
+2. Tile access ownership:
+   - Every tensor listed in tile.reads and tile.writes must belong to the same
+     KernelSpec, after resolving region views to their base tensor.
+
+3. Event dependency ownership and shape:
+   - Every waited/notified event must belong to the same KernelSpec.
+   - A tile may have at most one wait edge and one notify edge per logical event.
+   - Wait/notify coord mappings must return tuple/list values with the same
+     number of dimensions as the target event shape.
+   - notify_num and rank may only use integers, Vars, and ExprSpecs owned by
+     the same KernelSpec.
+   - Event coord expressions may also be lower-time/runtime values.  Runtime
+     event coords keep shape checks but skip semantic checks that require exact
+     static event coordinates.
+
+4. Event producer/waiter consistency:
+   - Any waited event must have at least one notifying tile.
+   - Any notified event must have at least one waiting tile.
+
+5. Static event count consistency:
+   - For each sampled/static event coordinate, the number of notifying tiles
+     must match event.init_count(coord).
+   - Every waited coordinate must have at least one corresponding notify.
+   - Symbolic shapes/grids are checked using deterministic samples.
+
+6. Declared tensor region shape and ownership:
+   - Region access dimensions must match tensor dimensions.
+   - Region start/extent expressions must be valid expr-like values.
+   - Region expressions may only reference Vars owned by the same KernelSpec.
+
+7. Tensor dependency event presence:
+   - If one tile writes a tensor and another tile reads the same tensor, there
+     must be at least one shared event between the writer's notifies and the
+     reader's waits. This is conservative and does not consider disjoint regions.
+
+8. Tensor region dependency coordinates:
+   - For sampled/static tile coordinates, overlapping write/read regions of the
+     same tensor must be connected by a matching notify/wait event coordinate.
+   - Static regions are also checked for tensor bounds.
+
+9. Waited-region source consistency:
+   - For each sampled/static read behind a wait, a tile notifying the waited
+     event coordinate must write an overlapping region of the same tensor.
+"""
 
 from __future__ import annotations
 
 from collections import defaultdict
+from dataclasses import dataclass
 from functools import reduce
+from types import FunctionType
 from itertools import product
 from operator import mul
 import random
 from typing import Any
-import warnings
 
-from ...dsl.spec import EventSpec, ExprSpec, RegionRange, RegionSpec, TensorSpec, VarSpec, eval_expr_like, expr_vars
-from .build import event_init_count
-from .impl_access import collect_impl_access
-from .model import SemanticPlan
-from .region import region_label, region_set_covers, regions_overlap
+from ...dsl.spec import (
+    EventSpec,
+    ExprSpec,
+    KernelSpec,
+    RegionRange,
+    RegionSpec,
+    TensorSpec,
+    TileSpec,
+    VarSpec,
+    eval_expr_like,
+    expr_vars,
+)
 
 
-def validate_semantic_plan(plan: SemanticPlan) -> SemanticPlan:
+@dataclass(frozen=True)
+class LogicalEdge:
+    """One logical event dependency from a producer tile to a consumer tile."""
+
+    event: EventSpec
+    producer: TileSpec
+    consumer: TileSpec
+
+
+def logical_edges(kernel: KernelSpec) -> tuple[LogicalEdge, ...]:
+    """Return logical event edges in stable event/tile order."""
+
+    event_notifiers: dict[int, list[TileSpec]] = {
+        id(event): [] for event in kernel.events.values()
+    }
+    event_waiters: dict[int, list[TileSpec]] = {id(event): [] for event in kernel.events.values()}
+    for tile in kernel.tiles:
+        for dependency in tile.notifies:
+            event = dependency.event
+            if tile not in event_notifiers.setdefault(id(event), []):
+                event_notifiers[id(event)].append(tile)
+        for dependency in tile.waits:
+            event = dependency.event
+            if tile not in event_waiters.setdefault(id(event), []):
+                event_waiters[id(event)].append(tile)
+
+    edges: list[LogicalEdge] = []
+    for event in kernel.events.values():
+        for producer in event_notifiers.get(id(event), []):
+            for consumer in event_waiters.get(id(event), []):
+                edges.append(LogicalEdge(event, producer, consumer))
+    return tuple(edges)
+
+
+def event_init_count(
+    event: EventSpec, coord: tuple[int, ...], env: dict[VarSpec, int] | None = None
+) -> int:
+    """Evaluate one logical event init count under an optional symbolic-var sample."""
+
+    count = event.init_count(*coord)
+    resolved = eval_expr_like(count, env)
+    if resolved is None:
+        resolved = count
+    if isinstance(resolved, bool) or not isinstance(resolved, int):
+        raise TypeError("event init_count must produce an integer")
+    if resolved < 0:
+        raise ValueError("event init_count must produce a non-negative integer")
+    return resolved
+
+
+def validate_kernel(kernel: KernelSpec) -> KernelSpec:
     """Validate DSL-level dependencies before lowering."""
 
-    tensor_ids = {id(tensor) for tensor in plan.tensors}
-    event_ids = {id(event) for event in plan.events}
-    var_ids = {id(var) for var in plan.kernel.vars.values()}
-    _validate_kernel_expr_ownership(plan, var_ids)
-    tile_names = [tile.name for tile in plan.tiles]
+    tensor_ids = {id(tensor) for tensor in kernel.tensors.values()}
+    event_ids = {id(event) for event in kernel.events.values()}
+    var_ids = {id(var) for var in kernel.vars.values()}
+    _validate_kernel_expr_ownership(kernel, var_ids)
+    tile_names = [tile.name for tile in kernel.tiles]
     if len(tile_names) != len(set(tile_names)):
-        raise ValueError("semantic plan contains duplicate tile names")
+        raise ValueError("kernel contains duplicate tile names")
 
-    producers: dict[int, list] = defaultdict(list)
-    consumers: dict[int, list] = defaultdict(list)
-    for tile in plan.tiles:
+    event_notifiers: dict[int, list[TileSpec]] = defaultdict(list)
+    event_waiters: dict[int, list[TileSpec]] = defaultdict(list)
+    for tile in kernel.tiles:
         for tensor in tile.reads:
             _validate_tile_tensor_access(tile, tensor, tensor_ids)
         for tensor in tile.writes:
             _validate_tile_tensor_access(tile, tensor, tensor_ids)
-        notified_events: set[int] = set()
+        # A tile has at most one notify edge per logical event.
+        notified_event_ids: set[int] = set()
         for dependency in tile.notifies:
             event = dependency.event
             coord = dependency.coord
             if id(event) not in event_ids:
                 raise ValueError(f"tile {tile.name!r} notifies event outside kernel")
-            if id(event) in notified_events:
+            if id(event) in notified_event_ids:
                 raise ValueError(
                     f"tile {tile.name!r} notifies event {event.name!r} more than once"
                 )
-            notified_events.add(id(event))
-            _validate_coord_shape(event, coord, tile.grid, f"{tile.name}.notify", var_ids)
-            if tile not in producers[id(event)]:
-                producers[id(event)].append(tile)
-        waited_events: set[int] = set()
+            notified_event_ids.add(id(event))
+            _validate_dependency_shape(
+                event, dependency, tile.grid, f"{tile.name}.notify", var_ids, tensor_ids, is_wait=False
+            )
+            if tile not in event_notifiers[id(event)]:
+                event_notifiers[id(event)].append(tile)
+        # A tile has at most one wait edge per logical event.
+        waited_event_ids: set[int] = set()
         for dependency in tile.waits:
             event = dependency.event
             coord = dependency.coord
             if id(event) not in event_ids:
                 raise ValueError(f"tile {tile.name!r} waits on event outside kernel")
-            if id(event) in waited_events:
+            if id(event) in waited_event_ids:
                 raise ValueError(
                     f"tile {tile.name!r} waits on event {event.name!r} more than once"
                 )
-            waited_events.add(id(event))
-            _validate_coord_shape(event, coord, tile.grid, f"{tile.name}.wait", var_ids)
-            if tile not in consumers[id(event)]:
-                consumers[id(event)].append(tile)
+            waited_event_ids.add(id(event))
+            _validate_dependency_shape(
+                event, dependency, tile.grid, f"{tile.name}.wait", var_ids, tensor_ids, is_wait=True
+            )
+            if tile not in event_waiters[id(event)]:
+                event_waiters[id(event)].append(tile)
 
-    for event in plan.events:
-        if consumers[id(event)] and not producers[id(event)]:
+    for event in kernel.events.values():
+        if event_waiters[id(event)] and not event_notifiers[id(event)]:
             raise ValueError(f"event {event.name!r} is waited on but has no producer")
-        if producers[id(event)] and not consumers[id(event)]:
+        if event_notifiers[id(event)] and not event_waiters[id(event)]:
             raise ValueError(f"event {event.name!r} is notified but has no consumer")
-        _validate_static_event_counts(event, producers[id(event)], consumers[id(event)])
+        _validate_static_event_counts(
+            event, event_notifiers[id(event)], event_waiters[id(event)], tensor_ids
+        )
 
-    _validate_region_dependencies(plan, var_ids)
-    _validate_impl_access_contract(plan)
+    _validate_region_dependencies(kernel, var_ids)
 
-    return plan
-
-
-
-def _validate_impl_access_contract(plan: SemanticPlan) -> None:
-    tensor_ids = {id(tensor) for tensor in plan.tensors}
-    envs = _sample_plan_envs(plan)
-    for tile in plan.tiles:
-        policy = tile.attrs.get("impl_access_validate", "error")
-        if policy not in ("error", "warn", "off"):
-            raise ValueError(
-                f"tile {tile.name!r} has unsupported impl_access_validate policy {policy!r}"
-            )
-        if policy == "off":
-            continue
-        impl_tensors = _tile_impl_tensor_attrs(tile, tensor_ids)
-        if not impl_tensors:
-            continue
-        try:
-            actual = collect_impl_access(tile.impl, tensors=impl_tensors, hooks=("prefetch", "run"))
-        except Exception as err:
-            _handle_impl_access_issue(
-                tile, policy, f"impl access collection failed: {err}", force_error=True
-            )
-            continue
-        for effect in actual.unknown_effects:
-            warnings.warn(
-                f"tile {tile.name!r} impl has unknown access effect: {effect}",
-                stacklevel=2,
-            )
-        _validate_actual_accesses(tile, actual.reads, tile.reads, "read", envs, policy)
-        _validate_actual_accesses(tile, actual.writes, tile.writes, "write", envs, policy)
+    return kernel
 
 
-def _handle_impl_access_issue(
-    tile, policy: str, message: str, *, force_error: bool = False
-) -> None:
-    full_message = f"tile {tile.name!r} {message}"
-    if force_error or policy == "error":
-        raise ValueError(full_message)
-    warnings.warn(full_message, stacklevel=3)
-
-
-def _tile_impl_tensor_attrs(tile, tensor_ids: set[int]) -> dict[str, TensorSpec]:
-    result: dict[str, TensorSpec] = {}
-    for attr_name, value in vars(tile.impl).items():
-        if isinstance(value, TensorSpec) and id(value.base_tensor) in tensor_ids:
-            result[attr_name] = value.base_tensor
-    return result
-
-
-def _validate_actual_accesses(tile, actual_accesses, declared_accesses, kind: str, envs, policy: str) -> None:
-    declared_by_tensor: dict[TensorSpec, list[TensorSpec]] = defaultdict(list)
-    for access in declared_accesses:
-        declared_by_tensor[access.base_tensor].append(access)
-
-    for actual in actual_accesses:
-        tensor = actual.tensor.base_tensor
-        candidates = declared_by_tensor.get(tensor, [])
-        if not candidates:
-            _handle_impl_access_issue(
-                tile,
-                policy,
-                f"impl {kind}s tensor {tensor.name!r} but tile.{kind}s does not declare it",
-            )
-            continue
-        if any(declared.region_from_tile is None for declared in candidates):
-            continue
-        if actual.tensor.region_from_tile is None:
-            warnings.warn(
-                f"tile {tile.name!r} impl {kind}s tensor {tensor.name!r} with unknown region; "
-                "cannot prove declared region coverage",
-                stacklevel=2,
-            )
-            continue
-        for env in envs:
-            tile_extents = _static_int_tuple(tile.grid, env)
-            if tile_extents is None:
-                continue
-            for idx in product(*(range(extent) for extent in tile_extents)):
-                actual_region = _region_from_access(actual.tensor, env, *idx)
-                declared_regions = [
-                    _region_from_access(declared, env, *idx) for declared in candidates
-                ]
-                if region_set_covers(declared_regions, actual_region):
-                    continue
-                _handle_impl_access_issue(
-                    tile,
-                    policy,
-                    f"impl {kind}s tensor {tensor.name!r} region "
-                    f"{region_label(actual_region)} outside declared tile.{kind}s regions",
-                )
-                break
-
-
-
-def _validate_kernel_expr_ownership(plan: SemanticPlan, var_ids: set[int]) -> None:
-    for tensor in plan.tensors:
+def _validate_kernel_expr_ownership(kernel: KernelSpec, var_ids: set[int]) -> None:
+    for tensor in kernel.tensors.values():
         _validate_expr_ownership(tensor.shape, var_ids, f"tensor {tensor.name!r} shape")
-    for event in plan.events:
+    for event in kernel.events.values():
         _validate_expr_ownership(event.shape, var_ids, f"event {event.name!r} shape")
-    for tile in plan.tiles:
+    for tile in kernel.tiles:
         _validate_expr_ownership(tile.grid, var_ids, f"tile {tile.name!r} grid")
 
 
@@ -207,9 +230,9 @@ def _validate_tile_tensor_access(tile, access: TensorSpec, tensor_ids: set[int])
         raise ValueError(f"tile {tile.name!r} references tensor outside kernel")
 
 
-def _validate_region_dependencies(plan: SemanticPlan, var_ids: set[int]) -> None:
-    tensor_ids = {id(tensor) for tensor in plan.tensors}
-    for tile in plan.tiles:
+def _validate_region_dependencies(kernel: KernelSpec, var_ids: set[int]) -> None:
+    tensor_ids = {id(tensor) for tensor in kernel.tensors.values()}
+    for tile in kernel.tiles:
         for access in tile.reads:
             if access.region_from_tile is not None:
                 _validate_tensor_region_access(tile, access, tensor_ids, is_write=False, var_ids=var_ids)
@@ -217,18 +240,18 @@ def _validate_region_dependencies(plan: SemanticPlan, var_ids: set[int]) -> None
             if access.region_from_tile is not None:
                 _validate_tensor_region_access(tile, access, tensor_ids, is_write=True, var_ids=var_ids)
 
-    _validate_tensor_dependency_events(plan)
-    _validate_region_dependency_coords(plan)
-    _validate_waited_region_sources(plan)
+    _validate_tensor_dependency_events(kernel)
+    _validate_region_dependency_coords(kernel)
+    _validate_waited_region_sources(kernel)
 
 
-def _validate_tensor_dependency_events(plan: SemanticPlan) -> None:
-    for producer in plan.tiles:
+def _validate_tensor_dependency_events(kernel: KernelSpec) -> None:
+    for producer in kernel.tiles:
         write_tensors = {_base_tensor(access) for access in producer.writes}
         if not write_tensors:
             continue
         notify_events = {id(dep.event) for dep in producer.notifies}
-        for consumer in plan.tiles:
+        for consumer in kernel.tiles:
             if consumer is producer:
                 continue
             shared_tensors = write_tensors & {_base_tensor(access) for access in consumer.reads}
@@ -244,17 +267,18 @@ def _validate_tensor_dependency_events(plan: SemanticPlan) -> None:
             )
 
 
-def _validate_region_dependency_coords(plan: SemanticPlan) -> None:
-    envs = _sample_plan_envs(plan)
+def _validate_region_dependency_coords(kernel: KernelSpec) -> None:
+    envs = _sample_kernel_envs(kernel)
+    tensor_ids = {id(tensor) for tensor in kernel.tensors.values()}
     for env in envs:
-        for producer in plan.tiles:
+        for producer in kernel.tiles:
             producer_extents = _static_int_tuple(producer.grid, env)
             if producer_extents is None:
                 continue
             producer_writes = list(producer.writes)
             if not producer_writes:
                 continue
-            for consumer in plan.tiles:
+            for consumer in kernel.tiles:
                 if consumer is producer:
                     continue
                 consumer_extents = _static_int_tuple(consumer.grid, env)
@@ -284,7 +308,7 @@ def _validate_region_dependency_coords(plan: SemanticPlan) -> None:
                                 if not regions_overlap(write_region, read_region):
                                     continue
                                 if _has_matching_event_coord(
-                                    producer, producer_idx, consumer, consumer_idx, env
+                                    producer, producer_idx, consumer, consumer_idx, env, tensor_ids
                                 ):
                                     continue
                                 raise ValueError(
@@ -295,10 +319,11 @@ def _validate_region_dependency_coords(plan: SemanticPlan) -> None:
                                 )
 
 
-def _validate_waited_region_sources(plan: SemanticPlan) -> None:
-    envs = _sample_plan_envs(plan)
+def _validate_waited_region_sources(kernel: KernelSpec) -> None:
+    envs = _sample_kernel_envs(kernel)
+    tensor_ids = {id(tensor) for tensor in kernel.tensors.values()}
     for env in envs:
-        for consumer in plan.tiles:
+        for consumer in kernel.tiles:
             consumer_extents = _static_int_tuple(consumer.grid, env)
             if consumer_extents is None:
                 continue
@@ -317,16 +342,19 @@ def _validate_waited_region_sources(plan: SemanticPlan) -> None:
                     )
                     for dependency in consumer.waits:
                         wait_event = dependency.event
-                        wait_map = dependency.coord
-                        wait_coord = _resolve_coord(_coord_from_map(wait_map, *consumer_idx), env)
+                        wait_coord = _static_dependency_coord(
+                            dependency, *consumer_idx, env=env, tensor_ids=tensor_ids
+                        )
+                        if wait_coord is None:
+                            continue
                         _validate_waited_region_source(
-                            plan, consumer, consumer_idx, tensor, read_region,
-                            wait_event, wait_coord, env
+                            kernel, consumer, consumer_idx, tensor, read_region,
+                            wait_event, wait_coord, env, tensor_ids
                         )
 
 
 def _validate_waited_region_source(
-    plan: SemanticPlan,
+    kernel: KernelSpec,
     consumer,
     consumer_idx,
     tensor: TensorSpec,
@@ -334,9 +362,10 @@ def _validate_waited_region_source(
     wait_event: EventSpec,
     wait_coord: tuple[Any, ...],
     env,
+    tensor_ids: set[int],
 ) -> None:
     has_same_tensor_event_writer = False
-    for producer in plan.tiles:
+    for producer in kernel.tiles:
         if producer is consumer:
             continue
         producer_writes = [access for access in producer.writes if access.base_tensor is tensor]
@@ -349,7 +378,9 @@ def _validate_waited_region_source(
         if producer_extents is None:
             continue
         for producer_idx in product(*(range(extent) for extent in producer_extents)):
-            if not _producer_notifies_coord(producer, producer_idx, wait_event, wait_coord, env):
+            if not _producer_notifies_coord(
+                producer, producer_idx, wait_event, wait_coord, env, tensor_ids
+            ):
                 continue
             for write_access in producer_writes:
                 write_region = _region_from_access(write_access, env, *producer_idx)
@@ -368,13 +399,19 @@ def _validate_waited_region_source(
         )
 
 
-def _producer_notifies_coord(producer, producer_idx, wait_event, wait_coord, env) -> bool:
+def _producer_notifies_coord(
+    producer, producer_idx, wait_event, wait_coord, env, tensor_ids: set[int]
+) -> bool:
     for dependency in producer.notifies:
         notify_event = dependency.event
         notify_map = dependency.coord
         if notify_event is not wait_event:
             continue
-        notify_coord = _resolve_coord(_coord_from_map(notify_map, *producer_idx), env)
+        notify_coord = _static_dependency_coord(
+            dependency, *producer_idx, env=env, tensor_ids=tensor_ids
+        )
+        if notify_coord is None:
+            return True
         if notify_coord == wait_coord:
             return True
     return False
@@ -384,17 +421,23 @@ def _base_tensor(access: TensorSpec) -> TensorSpec:
     return access.base_tensor
 
 
-def _has_matching_event_coord(producer, producer_idx, consumer, consumer_idx, env) -> bool:
+def _has_matching_event_coord(
+    producer, producer_idx, consumer, consumer_idx, env, tensor_ids: set[int]
+) -> bool:
     for notify_dep in producer.notifies:
         notify_event = notify_dep.event
-        notify_map = notify_dep.coord
-        notify_coord = _resolve_coord(_coord_from_map(notify_map, *producer_idx), env)
+        notify_coord = _static_dependency_coord(
+            notify_dep, *producer_idx, env=env, tensor_ids=tensor_ids
+        )
         for wait_dep in consumer.waits:
             wait_event = wait_dep.event
-            wait_map = wait_dep.coord
             if wait_event is not notify_event:
                 continue
-            wait_coord = _resolve_coord(_coord_from_map(wait_map, *consumer_idx), env)
+            wait_coord = _static_dependency_coord(
+                wait_dep, *consumer_idx, env=env, tensor_ids=tensor_ids
+            )
+            if notify_coord is None or wait_coord is None:
+                return True
             if wait_coord == notify_coord:
                 return True
     return False
@@ -464,7 +507,7 @@ def _resolve_region(region: RegionSpec | None, env: dict[VarSpec, int] | None) -
 def _validate_region_from_tile_shape(
     tensor: TensorSpec, region_from_tile, grid, label: str, var_ids: set[int] | None = None
 ) -> None:
-    rank = len(_shape_tuple(tensor.shape))
+    dim = len(_shape_tuple(tensor.shape))
     tile_extents = _static_int_tuple(grid)
     sample = (0, 0, 0)
     if tile_extents is not None:
@@ -472,9 +515,9 @@ def _validate_region_from_tile_shape(
     region = _region_from_tile(region_from_tile, *sample)
     if region is None:
         return
-    if len(region.dims) != rank:
+    if len(region.dims) != dim:
         raise ValueError(
-            f"{label} rank {len(region.dims)} does not match tensor {tensor.name!r} rank {rank}"
+            f"{label} has {len(region.dims)} dims, but tensor {tensor.name!r} has {dim} dims"
         )
     for dim in region.dims:
         if not _is_expr_like(dim.start):
@@ -492,8 +535,8 @@ def _validate_region_bounds(
         return
     if len(region.dims) != len(shape):
         raise ValueError(
-            f"{label} rank {len(region.dims)} does not match tensor {tensor.name!r} "
-            f"rank {len(shape)}"
+            f"{label} has {len(region.dims)} dims, but tensor {tensor.name!r} "
+            f"has {len(shape)} dims"
         )
     for dim, extent in zip(region.dims, shape):
         if not isinstance(dim.start, int) or isinstance(dim.start, bool):
@@ -521,8 +564,30 @@ def region_label(region: RegionSpec | None) -> str:
     return "[" + ", ".join(parts) + "]"
 
 
-def _sample_plan_envs(plan: SemanticPlan) -> list[dict[VarSpec, int] | None]:
-    vars_seen = list(plan.vars)
+
+def _collect_kernel_vars(kernel: KernelSpec) -> list[VarSpec]:
+    seen: set[VarSpec] = set()
+    result: list[VarSpec] = []
+
+    def add_from(value: Any) -> None:
+        for var in expr_vars(value):
+            if var not in seen:
+                seen.add(var)
+                result.append(var)
+
+    for var in kernel.vars.values():
+        add_from(var)
+    for tensor in kernel.tensors.values():
+        add_from(tensor.shape)
+    for event in kernel.events.values():
+        add_from(event.shape)
+    for tile in kernel.tiles:
+        add_from(tile.grid)
+    return result
+
+
+def _sample_kernel_envs(kernel: KernelSpec) -> list[dict[VarSpec, int] | None]:
+    vars_seen = list(_collect_kernel_vars(kernel))
     if not vars_seen:
         return [None]
 
@@ -544,17 +609,17 @@ def _sample_plan_envs(plan: SemanticPlan) -> list[dict[VarSpec, int] | None]:
         if key not in seen:
             seen.add(key)
             unique.append(env)
-    return [env for env in unique if _plan_sample_fits_budget(plan, env)]
+    return [env for env in unique if _kernel_sample_fits_budget(kernel, env)]
 
 
-def _plan_sample_fits_budget(plan: SemanticPlan, env: dict[VarSpec, int]) -> bool:
+def _kernel_sample_fits_budget(kernel: KernelSpec, env: dict[VarSpec, int]) -> bool:
     budget = 65536
     total = 0
-    for tensor in plan.tensors:
+    for tensor in kernel.tensors.values():
         total += _extent_product(_static_int_tuple(tensor.shape, env))
-    for event in plan.events:
+    for event in kernel.events.values():
         total += _extent_product(_static_int_tuple(event.shape, env))
-    for tile in plan.tiles:
+    for tile in kernel.tiles:
         total += _extent_product(_static_int_tuple(tile.grid, env))
     return total <= budget
 
@@ -573,34 +638,146 @@ def _static_int_tuple(values: Any, env: dict[VarSpec, int] | None = None) -> tup
     return tuple(result)
 
 
-def _coord_from_map(coord_fn, m_idx, n_idx, k_idx) -> tuple[Any, ...]:
-    mapped_coord = coord_fn(m_idx, n_idx, k_idx) if callable(coord_fn) else coord_fn
-    if not isinstance(mapped_coord, (tuple, list)):
-        raise TypeError(f"coord must return tuple/list, got {mapped_coord!r}")
-    return tuple(mapped_coord)
+def _dependency_info_from_map(
+    coord_fn,
+    m_idx,
+    n_idx,
+    k_idx,
+    notify_i=0,
+    *,
+    tensor_ids: set[int] | None = None,
+) -> tuple[Any, ...] | None:
+    if not callable(coord_fn):
+        raise TypeError("dependency coord must be callable")
+    _validate_dependency_coord_function(coord_fn, tensor_ids)
+    try:
+        mapped = coord_fn(m_idx, n_idx, k_idx, notify_i)
+    except TypeError:
+        if tensor_ids is not None and _coord_captures_kernel_tensor(coord_fn, tensor_ids):
+            return None
+        raise
+    if not isinstance(mapped, (tuple, list)):
+        raise TypeError(f"dependency coord must return tuple/list, got {mapped!r}")
+    if len(mapped) < 2:
+        raise ValueError("dependency coord must return (notify_num, rank, *event_coord)")
+    return tuple(mapped)
 
 
-def _validate_coord_shape(
-    event: EventSpec, coord, grid, label: str, var_ids: set[int] | None = None
+def _coord_from_map(
+    coord_fn,
+    m_idx,
+    n_idx,
+    k_idx,
+    notify_i=0,
+    *,
+    tensor_ids: set[int] | None = None,
+) -> tuple[Any, ...] | None:
+    info = _dependency_info_from_map(
+        coord_fn, m_idx, n_idx, k_idx, notify_i, tensor_ids=tensor_ids
+    )
+    return None if info is None else info[2:]
+
+
+def _validate_dependency_coord_function(coord_fn, tensor_ids: set[int] | None = None) -> None:
+    if not isinstance(coord_fn, FunctionType):
+        raise TypeError("dependency coord must be a Python function or lambda")
+    if coord_fn.__defaults__ is not None or coord_fn.__kwdefaults__ is not None:
+        raise TypeError("dependency coord must not use default arguments")
+    if tensor_ids is None:
+        return
+    for name in coord_fn.__code__.co_names:
+        value = coord_fn.__globals__.get(name)
+        if isinstance(value, TensorSpec) and id(value.base_tensor) in tensor_ids:
+            raise TypeError("dependency coord must capture TensorSpec through closure, not globals")
+
+
+def _coord_captures_kernel_tensor(coord_fn, tensor_ids: set[int]) -> bool:
+    closure = getattr(coord_fn, "__closure__", None)
+    if closure is None:
+        return False
+    for cell in closure:
+        try:
+            value = cell.cell_contents
+        except ValueError:
+            continue
+        if isinstance(value, TensorSpec) and id(value.base_tensor) in tensor_ids:
+            return True
+    return False
+
+
+def _dependency_coord_is_static(coord: tuple[Any, ...]) -> bool:
+    return all(_is_expr_like(value) for value in coord)
+
+
+def _static_dependency_coord(
+    dependency, m_idx, n_idx, k_idx, notify_i=0, env=None, tensor_ids: set[int] | None = None
+):
+    coord = _coord_from_map(
+        dependency.coord, m_idx, n_idx, k_idx, notify_i, tensor_ids=tensor_ids
+    )
+    if coord is None:
+        return None
+    if not _dependency_coord_is_static(coord):
+        return None
+    return _resolve_coord(coord, env)
+
+
+def _event_has_runtime_dependency_coord(
+    event: EventSpec, producers, consumers, tensor_ids: set[int]
+) -> bool:
+    for tile in (*producers, *consumers):
+        for dependency in (*tile.notifies, *tile.waits):
+            if dependency.event is not event:
+                continue
+            coord = _coord_from_map(dependency.coord, 0, 0, 0, tensor_ids=tensor_ids)
+            if coord is None or not _dependency_coord_is_static(coord):
+                return True
+    return False
+
+
+def _validate_dependency_shape(
+    event: EventSpec,
+    dependency,
+    grid,
+    label: str,
+    var_ids: set[int] | None = None,
+    tensor_ids: set[int] | None = None,
+    *,
+    is_wait: bool,
 ) -> None:
-    rank = len(_shape_tuple(event.shape))
+    dim = len(_shape_tuple(event.shape))
     tile_extents = _static_int_tuple(grid)
     sample = (0, 0, 0)
     if tile_extents is not None:
         sample = tuple(0 for _ in tile_extents)
-    coord = _coord_from_map(coord, *sample)
-    if len(coord) != rank:
+    info = _dependency_info_from_map(dependency.coord, *sample, 0, tensor_ids=tensor_ids)
+    if info is None:
+        return
+    notify_num, rank, *coord = info
+    if len(coord) != dim:
         raise ValueError(
-            f"{label} coord rank {len(coord)} does not match event {event.name!r} rank {rank}"
+            f"{label} coord has {len(coord)} dims, but event {event.name!r} has {dim} dims"
         )
+    if not _is_expr_like(notify_num):
+        raise TypeError(f"{label} notify_num contains unsupported value {notify_num!r}")
+    if not _is_expr_like(rank):
+        raise TypeError(f"{label} rank contains unsupported value {rank!r}")
+    if is_wait and notify_num != 1:
+        raise ValueError(f"{label} wait dependency must have notify_num == 1")
+    if is_wait and rank != -1:
+        raise ValueError(f"{label} wait dependency must have rank == -1")
+    values = [notify_num, rank]
     for value in coord:
         if not _is_expr_like(value):
             raise TypeError(f"{label} coord contains unsupported value {value!r}")
+        values.append(value)
     if var_ids is not None:
-        _validate_expr_ownership(coord, var_ids, label)
+        _validate_expr_ownership(tuple(values), var_ids, label)
 
 
-def _validate_static_event_counts(event: EventSpec, producers, consumers) -> None:
+def _validate_static_event_counts(event: EventSpec, producers, consumers, tensor_ids: set[int]) -> None:
+    if _event_has_runtime_dependency_coord(event, producers, consumers, tensor_ids):
+        return
     exact_envs = [None]
     if _static_int_tuple(event.shape) is None or any(
         _static_int_tuple(producer.grid) is None for producer in producers
@@ -610,11 +787,11 @@ def _validate_static_event_counts(event: EventSpec, producers, consumers) -> Non
         event_shape = _static_int_tuple(event.shape, env)
         if event_shape is None:
             continue
-        _validate_event_counts_for_shape(event, producers, consumers, event_shape, env)
+        _validate_event_counts_for_shape(event, producers, consumers, event_shape, env, tensor_ids)
 
 
 def _validate_event_counts_for_shape(
-    event: EventSpec, producers, consumers, event_shape: tuple[int, ...], env
+    event: EventSpec, producers, consumers, event_shape: tuple[int, ...], env, tensor_ids: set[int]
 ) -> None:
     notify_counts: dict[tuple[int, ...], int] = defaultdict(int)
     for producer in producers:
@@ -627,12 +804,23 @@ def _validate_event_counts_for_shape(
                 coord = dependency.coord
                 if notify_event is not event:
                     continue
-                coord = _resolve_coord(_coord_from_map(coord, *idx), env)
-                _validate_static_coord(event, coord, event_shape, f"{producer.name}.notify")
-                notify_counts[coord] += 1
+                info = _dependency_info_from_map(coord, *idx, 0)
+                if info is None:
+                    return
+                notify_num = _resolve_expr_value(info[0], env)
+                if isinstance(notify_num, bool) or not isinstance(notify_num, int) or notify_num < 1:
+                    raise ValueError(f"{producer.name}.notify notify_num must be a positive integer")
+                for notify_i in range(notify_num):
+                    coord_value = _static_dependency_coord(
+                        dependency, *idx, notify_i=notify_i, env=env, tensor_ids=tensor_ids
+                    )
+                    if coord_value is None:
+                        return
+                    _validate_static_coord(event, coord_value, event_shape, f"{producer.name}.notify")
+                    notify_counts[coord_value] += 1
 
     for coord in product(*(range(extent) for extent in event_shape)):
-        expected = event_init_count(event, coord)
+        expected = event_init_count(event, coord, env)
         actual = notify_counts.get(coord, 0)
         if actual != expected:
             raise ValueError(
@@ -650,7 +838,9 @@ def _validate_event_counts_for_shape(
                 coord = dependency.coord
                 if wait_event is not event:
                     continue
-                coord = _resolve_coord(_coord_from_map(coord, *idx), env)
+                coord = _static_dependency_coord(dependency, *idx, env=env, tensor_ids=tensor_ids)
+                if coord is None:
+                    continue
                 _validate_static_coord(event, coord, event_shape, f"{consumer.name}.wait")
                 if notify_counts.get(coord, 0) == 0:
                     raise ValueError(
@@ -755,8 +945,8 @@ def _validate_static_coord(
 ) -> None:
     if len(coord) != len(shape):
         raise ValueError(
-            f"{label} coord rank {len(coord)} does not match event {event.name!r} "
-            f"rank {len(shape)}"
+            f"{label} coord has {len(coord)} dims, but event {event.name!r} "
+            f"has {len(shape)} dims"
         )
     for value, extent in zip(coord, shape):
         if not isinstance(value, int) or isinstance(value, bool):
@@ -768,4 +958,4 @@ def _validate_static_coord(
             )
 
 
-__all__ = ["validate_semantic_plan"]
+__all__ = ["LogicalEdge", "event_init_count", "logical_edges", "validate_kernel"]

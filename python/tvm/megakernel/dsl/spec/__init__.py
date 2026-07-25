@@ -19,8 +19,12 @@
 
 from .core import (
     CoordMapType,
+    D,
+    DependencyBuilder,
+    DependencyCoordMap,
     DependencySpec,
     EventSpec,
+    InvCoordMap,
     KernelSpec,
     ShapeType,
     TensorSpec,
@@ -32,8 +36,12 @@ from .region import R, RegionBuilder, RegionRange, RegionSpec, TileRegionMap, Ti
 
 __all__ = [
     "CoordMapType",
+    "D",
+    "DependencyBuilder",
+    "DependencyCoordMap",
     "DependencySpec",
     "EventSpec",
+    "InvCoordMap",
     "ExprLike",
     "ExprSpec",
     "KernelSpec",

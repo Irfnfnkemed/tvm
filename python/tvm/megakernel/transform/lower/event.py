@@ -19,17 +19,20 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import FunctionType
 from typing import Any
 
 import tvm.tirx.script as T
 
-from ...dsl.spec import EventSpec, ExprSpec, VarSpec
-from .prepare import EVENT_INIT_COMPLETE_NAME, INIT_EVENT_JOB_ID, WAIT_EVENT_INIT_JOB_ID
-from .scheduler import StaticTileScheduler, TIRXSemaphore
-
-
-EVENT_WAIT_MARKER = "tirx.megakernel.event.wait"
-EVENT_NOTIFY_MARKER = "tirx.megakernel.event.notify"
+from ...dsl.spec import DependencySpec, EventSpec, ExprSpec, TensorSpec, VarSpec
+from .prepare import (
+    EVENT_INIT_COMPLETE_NAME,
+    INIT_EVENT_JOB_ID,
+    WAIT_EVENT_INIT_JOB_ID,
+    TensorBinding,
+    replace_tensor_specs,
+)
+from .scheduler import StaticTileScheduler, StaticTIRXSemaphore
 
 
 @dataclass
@@ -54,10 +57,10 @@ def _wait_event_init_complete(
             T.ptx.ld_global_acquire(state[0], T.address_of(buffer[coord]))
         if T.ptx.any_sync(
             0xFFFFFFFF,
-            (state[0] <= sm_count * (TIRXSemaphore.base + 1)) & (state[0] > 0),
+            (state[0] <= sm_count * (StaticTIRXSemaphore.base + 1)) & (state[0] > 0),
         ):
             if (lane_id == 0) & (warp_id == 0):
-                T.cuda.atomic_add(T.address_of(buffer[coord]), -(TIRXSemaphore.base + 1))
+                T.cuda.atomic_add(T.address_of(buffer[coord]), -(StaticTIRXSemaphore.base + 1))
             break
         T.cuda.nano_sleep(40)
 
@@ -87,10 +90,10 @@ class EventLoweringMixin:
                         coord = linear_index_to_coord(
                             idx[0], event_shape_tuple(event.shape, f"event {event.name} shape", plan)
                         )
-                        init_count = event_init_count(event, coord)
+                        init_count = event_init_count(event, coord, plan)
                         T.buffer_store(
                             binding.buffer,
-                            init_count * (TIRXSemaphore.base + 1),
+                            init_count * (StaticTIRXSemaphore.base + 1),
                             list(coord),
                         )
                         T.buffer_store(idx, idx[0] + num_threads, [0])
@@ -100,7 +103,7 @@ class EventLoweringMixin:
             with T.If(event_id == len(events)):
                 with T.Then():
                     sm_count = plan.options.attrs.get("sm_count", 1)
-                    complete_init = (len(events) + 1 + sm_count) * (TIRXSemaphore.base + 1)
+                    complete_init = (len(events) + 1 + sm_count) * (StaticTIRXSemaphore.base + 1)
                     T.buffer_store(
                         plan.event_init_complete.buffer,
                         complete_init,
@@ -111,7 +114,7 @@ class EventLoweringMixin:
     def emit_event_init_complete_notify(self, plan, scheduler: StaticTileScheduler) -> None:
         if plan.event_init_complete is None:
             return
-        semaphore = TIRXSemaphore(plan.event_init_complete.buffer)
+        semaphore = StaticTIRXSemaphore(plan.event_init_complete.buffer)
 
         def notify_func(_notify_idx):
             return (1, -1, event_init_complete_coord(plan))
@@ -158,39 +161,6 @@ class EventLoweringMixin:
             size=1,
         )
         return plan.event_bindings
-
-
-def emit_events(
-    dependencies,
-    marker: str,
-    scheduler: StaticTileScheduler | None,
-    event_bindings: dict[str, EventBinding],
-    m_idx,
-    n_idx,
-    k_idx,
-    options,
-) -> None:
-    if not dependencies:
-        return
-    for dependency in dependencies:
-        event = dependency.event
-        coord = dependency.coord
-        coord = coord_from_map(coord, m_idx, n_idx, k_idx)
-        if event.name not in event_bindings:
-            if options.emit_event_markers:
-                emit_marker(marker, event.name, *coord)
-        elif marker == EVENT_WAIT_MARKER:
-            semaphore = TIRXSemaphore(event_bindings[event.name].buffer)
-            scheduler.wait(semaphore, *coord)
-        elif marker == EVENT_NOTIFY_MARKER:
-            semaphore = TIRXSemaphore(event_bindings[event.name].buffer)
-
-            def notify_func(_notify_idx, coord=coord):
-                return (1, -1, *coord)
-
-            scheduler.notify(semaphore, notify_func, scope="cta")
-        else:
-            raise ValueError(f"Unknown event marker: {marker}")
 
 
 def event_workspace_size(events: list[EventSpec], plan) -> Any:
@@ -261,24 +231,101 @@ def linear_index_to_coord(linear_idx, shape: tuple[int, ...]) -> tuple[Any, ...]
     return tuple(reversed(coord))
 
 
-def event_init_count(event: EventSpec, coord: tuple[Any, ...]):
+def event_init_count(event: EventSpec, coord: tuple[Any, ...], plan=None):
     count = event.init_count(*coord)
-    if isinstance(count, bool) or not isinstance(count, int):
+    if isinstance(count, bool):
         raise TypeError("event init_count must produce an integer")
-    if count < 0:
-        raise ValueError("event init_count must produce a non-negative integer")
-    return count
+    if isinstance(count, int):
+        if count < 0:
+            raise ValueError("event init_count must produce a non-negative integer")
+        return count
+    if isinstance(count, (VarSpec, ExprSpec)):
+        if plan is None:
+            raise TypeError("symbolic event init_count requires a lowering plan")
+        return event_lower_expr_like(count, f"event {event.name} init_count", plan)
+    raise TypeError("event init_count must produce an integer, VarSpec, or ExprSpec")
 
 
-def coord_from_map(coord, m_idx, n_idx, k_idx) -> tuple[Any, ...]:
-    if callable(coord):
-        coord = coord(m_idx, n_idx, k_idx)
-    else:
-        coord = coord
-    if not isinstance(coord, (tuple, list)):
-        raise TypeError(f"coord must produce a tuple/list coordinate, got {coord!r}")
-    return tuple(coord)
+def dependency_info_from_map(
+    dependency: DependencySpec,
+    m_idx,
+    n_idx,
+    k_idx,
+    notify_i,
+    *,
+    tensor_bindings: dict[TensorSpec, TensorBinding] | None = None,
+) -> tuple[Any, ...]:
+    coord = dependency.coord
+    if tensor_bindings is not None:
+        coord = bind_dependency_coord(coord, tensor_bindings)
+    info = coord(m_idx, n_idx, k_idx, notify_i)
+    if tensor_bindings is not None:
+        info = replace_tensor_specs(info, tensor_bindings)
+    if not isinstance(info, (tuple, list)):
+        raise TypeError(f"dependency coord must return tuple/list, got {info!r}")
+    if len(info) < 2:
+        raise ValueError("dependency coord must return (notify_num, rank, *event_coord)")
+    return tuple(info)
 
 
-def emit_marker(name: str, *args: Any) -> None:
-    T.evaluate(T.call_extern("void", name, *args))
+def coord_from_map(
+    dependency: DependencySpec,
+    m_idx,
+    n_idx,
+    k_idx,
+    notify_i=0,
+    *,
+    tensor_bindings: dict[TensorSpec, TensorBinding] | None = None,
+) -> tuple[Any, ...]:
+    return dependency_info_from_map(
+        dependency, m_idx, n_idx, k_idx, notify_i, tensor_bindings=tensor_bindings
+    )[2:]
+
+
+def bind_dependency_coord(
+    coord, tensor_bindings: dict[TensorSpec, TensorBinding]
+):
+    if not isinstance(coord, FunctionType):
+        raise TypeError("dependency coord must be a Python function or lambda")
+    if coord.__defaults__ is not None or coord.__kwdefaults__ is not None:
+        raise TypeError("dependency coord must not use default arguments")
+    _reject_global_tensor_refs(coord)
+    closure = coord.__closure__
+    if closure is None:
+        return coord
+    cells = tuple(_bind_dependency_cell(cell, tensor_bindings) for cell in closure)
+    bound = FunctionType(coord.__code__, coord.__globals__, coord.__name__, None, cells)
+    bound.__dict__.update(getattr(coord, "__dict__", {}))
+    bound.__annotations__ = getattr(coord, "__annotations__", {}).copy()
+    bound.__qualname__ = getattr(coord, "__qualname__", coord.__name__)
+    return bound
+
+
+def _reject_global_tensor_refs(coord) -> None:
+    for name in coord.__code__.co_names:
+        value = coord.__globals__.get(name)
+        if isinstance(value, TensorSpec):
+            raise TypeError(
+                "dependency coord must capture TensorSpec through closure, not globals"
+            )
+
+
+def _bind_dependency_cell(cell, tensor_bindings: dict[TensorSpec, TensorBinding]):
+    try:
+        value = cell.cell_contents
+    except ValueError:
+        return cell
+    if isinstance(value, TensorSpec):
+        tensor = value.base_tensor
+        if tensor not in tensor_bindings:
+            raise ValueError("dependency coord captures TensorSpec outside this kernel")
+        return _make_cell(tensor_bindings[tensor].buffer)
+    return cell
+
+
+def _make_cell(value):
+    def capture():
+        return value
+
+    return capture.__closure__[0]
+

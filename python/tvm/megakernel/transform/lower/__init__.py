@@ -16,25 +16,10 @@
 # under the License.
 """TIRX megakernel lowering backend."""
 
-from .tirx import (
-    LowerMegakernelDSL,
-    MegakernelLowerer,
-    lower_queue_init_to_tirx,
-    lower_static_queue_init_to_tirx,
-    lower_to_tirx,
-    lower_to_tirx_module,
-)
-from .prepare import LoweringOptions, NormalizedMegakernelPlan, LoweringPlan, StaticLoweringPlan
+from .lower import lower
+from .prepare import LoweringOptions
 
 __all__ = [
-    "LowerMegakernelDSL",
     "LoweringOptions",
-    "MegakernelLowerer",
-    "NormalizedMegakernelPlan",
-    "LoweringPlan",
-    "StaticLoweringPlan",
-    "lower_queue_init_to_tirx",
-    "lower_static_queue_init_to_tirx",
-    "lower_to_tirx",
-    "lower_to_tirx_module",
+    "lower",
 ]

@@ -32,7 +32,9 @@ from ..impl import TileImpl
 
 
 ShapeType = ExprLike | tuple[ExprLike, ...] | list[ExprLike]
-CoordMapType = Callable[[int, int, int], tuple[int, ...]] | tuple[int, ...] | list[int]
+DependencyCoordMap = Callable[[Any, Any, Any, Any], tuple[Any, ...] | list[Any]]
+InvCoordMap = Callable[..., tuple[Any, Any, Any, Any] | list[Any]]
+CoordMapType = DependencyCoordMap
 GridType = tuple[ExprLike, ExprLike, ExprLike] | list[ExprLike]
 
 
@@ -77,7 +79,7 @@ class EventSpec:
 
     name: str
     shape: tuple[ExprLike, ...]
-    init_count: Callable[..., int]
+    init_count: Callable[..., ExprLike]
     dtype: str = "int32"
     attrs: dict[str, Any] = field(default_factory=dict)
 
@@ -86,14 +88,56 @@ class EventSpec:
 class DependencySpec:
     """Internal event dependency attached to a tile wait or notify.
 
-    ``coord`` maps the tile index ``(m, n, k)`` to the event coordinate.
-    ``inverse_coord`` maps an event coordinate back to a consumer tile index
-    for dynamic scheduling.
+    Dependencies are created through the user-facing ``D`` builder.  ``coord``
+    is the forward mapping from the current tile coordinate to the event
+    coordinate touched by this dependency::
+
+        coord(tile_m, tile_n, tile_k, notify_i) -> (notify_num, rank, *event_coord)
+
+    ``notify_i`` is the worker index inside the selected notify scope.
+    ``notify_num`` tells the scheduler how many workers participate in the
+    notify operation.  ``rank`` is the destination rank; ``-1`` means local.
+    For wait dependencies, lowering calls ``coord(m, n, k, 0)`` and only waits
+    on ``event_coord``.  Wait dependencies must therefore describe exactly one
+    local event coordinate, i.e. ``notify_num == 1`` and ``rank == -1``.
+
+    ``inv_coord`` is the reverse mapping used only by dynamic scheduling when
+    a notified event should push consumer tiles into the dynamic queue::
+
+        inv_coord(rank, *event_coord, consumer_i) -> (consumer_num, tile_m, tile_n, tile_k)
+
+    ``consumer_i`` is the fan-out index for cases where one ready event
+    coordinate maps to multiple consumer tile coordinates.  ``consumer_num``
+    is the total fan-out count for this ``(rank, *event_coord)``.  Lowering
+    reads ``consumer_num`` from ``consumer_i == 0`` and then calls
+    ``inv_coord`` for ``consumer_i`` in ``[0, consumer_num)``.
     """
 
     event: EventSpec
-    coord: CoordMapType
-    inverse_coord: CoordMapType | None = None
+    coord: DependencyCoordMap
+    inv_coord: InvCoordMap | None = None
+
+
+class DependencyBuilder:
+    """Build normalized event dependencies for ``TileSpec.wait``/``notify``."""
+
+    def __call__(
+        self,
+        event: EventSpec,
+        coord: DependencyCoordMap,
+        *,
+        inv_coord: InvCoordMap | None = None,
+    ) -> DependencySpec:
+        if not isinstance(event, EventSpec):
+            raise TypeError("dependency event must be an EventSpec")
+        if not callable(coord):
+            raise TypeError("dependency coord must be callable")
+        if inv_coord is not None and not callable(inv_coord):
+            raise TypeError("dependency inv_coord must be callable")
+        return DependencySpec(event=event, coord=coord, inv_coord=inv_coord)
+
+
+D = DependencyBuilder()
 
 
 @dataclass
@@ -109,44 +153,20 @@ class TileSpec:
     notifies: list[DependencySpec] = field(default_factory=list)
     attrs: dict[str, Any] = field(default_factory=dict)
 
-    def wait(
-        self,
-        event: EventSpec,
-        coord: CoordMapType,
-        inverse_coord: CoordMapType | None = None,
-    ):
-        """Declare an event wait.
+    def wait(self, dependency: DependencySpec):
+        """Declare an event wait dependency."""
 
-        ``coord`` maps tile index ``(m, n, k)`` to the event coordinate.
-        ``inverse_coord`` maps event coordinate back to the consumer tile
-        index and is required by dynamic scheduling.
-        """
-
-        self.waits.append(
-            DependencySpec(
-                event=event,
-                coord=_normalize_coord(coord, f"tile {self.name!r}.wait coord"),
-                inverse_coord=(
-                    None
-                    if inverse_coord is None
-                    else _normalize_coord(inverse_coord, f"tile {self.name!r}.wait inverse_coord")
-                ),
-            )
-        )
+        if not isinstance(dependency, DependencySpec):
+            raise TypeError("TileSpec.wait expects a DependencySpec; use D(event, coord, ...)")
+        self.waits.append(dependency)
         return self
 
-    def notify(self, event: EventSpec, coord: CoordMapType):
-        """Declare an event notify.
+    def notify(self, dependency: DependencySpec):
+        """Declare an event notify dependency."""
 
-        ``coord`` maps tile index ``(m, n, k)`` to the event coordinate.
-        """
-
-        self.notifies.append(
-            DependencySpec(
-                event=event,
-                coord=_normalize_coord(coord, f"tile {self.name!r}.notify coord"),
-            )
-        )
+        if not isinstance(dependency, DependencySpec):
+            raise TypeError("TileSpec.notify expects a DependencySpec; use D(event, coord, ...)")
+        self.notifies.append(dependency)
         return self
 
 
@@ -199,7 +219,7 @@ class KernelSpec:
         self,
         name: str,
         shape: ShapeType,
-        init_count: int | Callable[..., int],
+        init_count: ExprLike | Callable[..., ExprLike],
         dtype: str = "int32",
         attrs: dict[str, Any] | None = None,
     ):
@@ -246,16 +266,16 @@ class KernelSpec:
         return tile
 
     def validate(self):
-        """Build and validate the DSL semantic plan for this kernel."""
+        """Validate this kernel."""
 
-        from tvm.megakernel.transform.semantic import build_semantic_plan, validate_semantic_plan
+        from tvm.megakernel.transform.validate import validate_kernel
 
-        return validate_semantic_plan(build_semantic_plan(self))
+        return validate_kernel(self)
 
     def lower(self, options=None):
-        from tvm.megakernel.transform import lower_to_tirx
+        from tvm.megakernel.transform import lower
 
-        return lower_to_tirx(self, options)
+        return lower(self, options)
 
 
 def _normalize_accesses(accesses: list[TensorSpec], label: str) -> list[TensorSpec]:
@@ -275,13 +295,6 @@ def _normalize_shape(shape: ShapeType, label: str) -> tuple[ExprLike, ...]:
     return values
 
 
-def _normalize_coord(coord: CoordMapType, label: str) -> CoordMapType:
-    if callable(coord):
-        return coord
-    if isinstance(coord, (tuple, list)):
-        return tuple(coord)
-    raise TypeError(f"{label} must be callable or tuple/list")
-
 
 def _normalize_grid(grid: GridType, label: str) -> tuple[ExprLike, ExprLike, ExprLike]:
     if not isinstance(grid, (tuple, list)):
@@ -295,9 +308,11 @@ def _normalize_grid(grid: GridType, label: str) -> tuple[ExprLike, ExprLike, Exp
     return values
 
 
-def _normalize_event_init_count(init_count: int | Callable[..., int]) -> Callable[..., int]:
+def _normalize_event_init_count(
+    init_count: ExprLike | Callable[..., ExprLike],
+) -> Callable[..., ExprLike]:
     if isinstance(init_count, bool):
-        raise TypeError("event init_count must be an int or callable")
+        raise TypeError("event init_count must be an int, VarSpec, ExprSpec, or callable")
     if isinstance(init_count, int):
         if init_count < 0:
             raise ValueError("event init_count must be non-negative")
@@ -306,6 +321,12 @@ def _normalize_event_init_count(init_count: int | Callable[..., int]) -> Callabl
             return value
 
         return uniform_init_count
+    if isinstance(init_count, (VarSpec, ExprSpec)):
+
+        def uniform_init_count(*_coord, value=init_count):
+            return value
+
+        return uniform_init_count
     if callable(init_count):
         return init_count
-    raise TypeError("event init_count must be an int or callable")
+    raise TypeError("event init_count must be an int, VarSpec, ExprSpec, or callable")

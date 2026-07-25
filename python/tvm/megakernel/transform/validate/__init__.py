@@ -14,16 +14,18 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-"""Semantic megakernel transform layer."""
+"""Megakernel validation entry points."""
 
-from .build import build_semantic_plan, logical_edges
-from .model import LogicalEdge, SemanticPlan
-from .validate import validate_semantic_plan
+from .impl import validate_impl
+from .lower import validate_lowering_plan, validate_static_lowering_plan
+from .semantic import LogicalEdge, event_init_count, logical_edges, validate_kernel
 
 __all__ = [
     "LogicalEdge",
-    "SemanticPlan",
-    "build_semantic_plan",
+    "event_init_count",
     "logical_edges",
-    "validate_semantic_plan",
+    "validate_impl",
+    "validate_lowering_plan",
+    "validate_static_lowering_plan",
+    "validate_kernel",
 ]
