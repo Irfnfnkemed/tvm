@@ -54,9 +54,9 @@ import warnings
 from dataclasses import dataclass, field
 from typing import Any
 
-from tvm.ir import Range
+from tvm.ir import Call, Expr, Range
 import tvm.tirx.script as T
-from tvm.tirx import Buffer, BufferLoad, BufferRegion, Call, PrimExpr, Stmt, TilePrimitiveCall, Var
+from tvm.tirx import Buffer, BufferLoad, BufferRegion, Stmt, TilePrimitiveCall, Var
 from tvm.tirx.expr_functor import ExprVisitor
 from tvm.tirx.stmt_functor import StmtVisitor
 
@@ -462,7 +462,7 @@ class _AccessCollector(StmtVisitor):
         self.access = ImplAccess()
 
     def visit_expr(self, expr):
-        if isinstance(expr, PrimExpr):
+        if isinstance(expr, Expr):
             _ReadExprCollector(self.access, self.buffer_tensors).visit_expr(expr)
 
     def visit_buffer_store_(self, op):
@@ -498,7 +498,7 @@ class _AccessCollector(StmtVisitor):
         for i, dst in enumerate(dsts):
             self._record_value(dst, "write", f"{_op_name(op)}.dsts[{i}]")
         for value in op.config.values():
-            if isinstance(value, PrimExpr):
+            if isinstance(value, Expr):
                 self.visit_expr(value)
 
     def visit_evaluate_(self, op):
@@ -513,7 +513,7 @@ class _AccessCollector(StmtVisitor):
             self._record_point(value.buffer, value.indices, "read", source)
         elif isinstance(value, Buffer):
             self._record_region(_full_region(value), kind, source)
-        elif isinstance(value, PrimExpr):
+        elif isinstance(value, Expr):
             self.visit_expr(value)
 
     def _record_region(self, region: BufferRegion, kind: str, source: str) -> None:

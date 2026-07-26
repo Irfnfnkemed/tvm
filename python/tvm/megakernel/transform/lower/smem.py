@@ -151,12 +151,10 @@ class TIRXSmemManager(SmemManager):
         buffer = pool_allocator.alloc(
             shape,
             dtype,
-            strides,
-            scope,
-            align,
-            buffer_type,
-            axis_separators,
-            layout,
+            strides=strides,
+            scope=scope,
+            align=align,
+            layout=layout,
         )
         end = pool_allocator.offset
         size = end - beg
