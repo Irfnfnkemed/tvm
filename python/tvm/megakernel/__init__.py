@@ -16,22 +16,26 @@
 # under the License.
 """Megakernel DSL prototypes."""
 
+from .dsl import D, KernelSpec, R, SmemManager, TileImpl
 from .transform import (
-    LowerMegakernelDSL,
+    LogicalEdge,
     LoweringOptions,
-    MegakernelLowerer,
-    NormalizedMegakernelPlan,
-    lower_static_queue_init_to_tirx,
-    lower_to_tirx,
-    lower_to_tirx_module,
+    logical_edges,
+    lower,
+    validate_impl,
+    validate_kernel,
 )
 
 __all__ = [
-    "LowerMegakernelDSL",
+    "D",
+    "KernelSpec",
+    "LogicalEdge",
     "LoweringOptions",
-    "MegakernelLowerer",
-    "NormalizedMegakernelPlan",
-    "lower_static_queue_init_to_tirx",
-    "lower_to_tirx",
-    "lower_to_tirx_module",
+    "R",
+    "SmemManager",
+    "TileImpl",
+    "logical_edges",
+    "lower",
+    "validate_impl",
+    "validate_kernel",
 ]
