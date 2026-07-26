@@ -92,25 +92,26 @@ class DependencySpec:
     is the forward mapping from the current tile coordinate to the event
     coordinate touched by this dependency::
 
-        coord(tile_m, tile_n, tile_k, notify_i) -> (notify_num, rank, *event_coord)
+        coord(tile_m, tile_n, tile_k, i) -> (coord_count, rank, *event_coord)
 
-    ``notify_i`` is the worker index inside the selected notify scope.
-    ``notify_num`` tells the scheduler how many workers participate in the
-    notify operation.  ``rank`` is the destination rank; ``-1`` means local.
+    ``i`` is the mapping index.  For notify lowering, this is carried by
+    the selected notify scope worker index.  ``coord_count`` tells the scheduler
+    how many event coordinates this tile dependency expands to.  ``rank`` is
+    the destination rank; ``-1`` means local.
     For wait dependencies, lowering calls ``coord(m, n, k, 0)`` and only waits
     on ``event_coord``.  Wait dependencies must therefore describe exactly one
-    local event coordinate, i.e. ``notify_num == 1`` and ``rank == -1``.
+    local event coordinate, i.e. ``coord_count == 1`` and ``rank == -1``.
 
     ``inv_coord`` is the reverse mapping used only by dynamic scheduling when
     a notified event should push consumer tiles into the dynamic queue::
 
-        inv_coord(rank, *event_coord, consumer_i) -> (consumer_num, tile_m, tile_n, tile_k)
+        inv_coord(rank, *event_coord, consumer_i) -> (consumer_count, tile_m, tile_n, tile_k)
 
     ``consumer_i`` is the fan-out index for cases where one ready event
-    coordinate maps to multiple consumer tile coordinates.  ``consumer_num``
+    coordinate maps to multiple consumer tile coordinates.  ``consumer_count``
     is the total fan-out count for this ``(rank, *event_coord)``.  Lowering
-    reads ``consumer_num`` from ``consumer_i == 0`` and then calls
-    ``inv_coord`` for ``consumer_i`` in ``[0, consumer_num)``.
+    reads ``consumer_count`` from ``consumer_i == 0`` and then calls
+    ``inv_coord`` for ``consumer_i`` in ``[0, consumer_count)``.
     """
 
     event: EventSpec

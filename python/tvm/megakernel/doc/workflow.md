@@ -54,7 +54,7 @@ Before writing Python DSL, identify:
 The plan is logical.  It should not contain atomics, spin loops, mbarrier layout,
 CUDA source snippets, or TIRX statement bodies.  Those belong to lowering.
 
-Use [plan.md](plan.md) as the planning contract.
+Use [plan.md](plan.md) as the natural-language planning guide.
 
 ## Step 3: Write The Spec Layer
 
@@ -85,7 +85,7 @@ region shape, bounds, and producer-consumer overlap validation.
 Both waits and notifies use the same dependency builder:
 
 ```python
-tile.notify(D(event, lambda m, n, k, i: (notify_num, remote_rank, *event_coord)))
+tile.notify(D(event, lambda m, n, k, i: (coord_count, remote_rank, *event_coord)))
 tile.wait(D(event, wait_coord, inv_coord=consumer_inverse))
 ```
 
@@ -93,18 +93,18 @@ The forward mapping is producer/consumer local:
 
 ```text
 coord(tile_m, tile_n, tile_k, notify_i)
-  -> (notify_num, remote_rank, *event_coord)
+  -> (coord_count, remote_rank, *event_coord)
 ```
 
 The reverse mapping is dynamic-scheduler only:
 
 ```text
 inv_coord(remote_rank, *event_coord, consumer_i)
-  -> (consumer_num, tile_m, tile_n, tile_k)
+  -> (consumer_count, tile_m, tile_n, tile_k)
 ```
 
-For statically checkable batch notifies, validation checks every `notify_i`:
-`notify_num` must be stable, event coordinates must be inside the event shape,
+For statically checkable multi-coordinate notifies, validation checks every `notify_i`:
+`coord_count` must be stable, event coordinates must be inside the event shape,
 and one tile notify must not generate duplicate `(remote_rank, event_coord)`
 entries.
 
@@ -119,6 +119,9 @@ not duplicate another consumer tile for the same event coord.
 
 `TileImpl` contains local parser-style TIRX code for one tile instance.  It may
 use `SmemManager` for managed shared-memory allocation and phase markers.
+TileImpl constructors may capture spec-layer tensors and symbolic expressions;
+validation and lowering replace those captures with sample values, upper-bound
+capacities, or runtime TIR values depending on the phase.
 
 Dependency policy should stay out of `TileImpl`.  A tile implementation should
 not hand-write global waits/notifies for DSL events; those come from
@@ -141,7 +144,9 @@ Validation is split by object boundary:
 Runtime tensor indexing inside dependency coordinate functions is allowed for
 MegaMoE-style routing, but some static checks cannot prove its dimensions or
 round-trip behavior.  Those checks are skipped with warnings and must be covered
-by workload tests.
+by workload tests.  Dependency coordinate functions should capture routing
+`TensorSpec` objects through closures; default-argument or global captures are
+rejected because lowering cannot safely rewrite them.
 
 ## Step 7: Lower
 
@@ -194,21 +199,6 @@ The dynamic scheduler follows the PR/old megakernel execution model:
 
 This model allows consumers to be scheduled as soon as their producers have
 been dispatched far enough to avoid deadlock, while waits still protect the
-actual data dependency before `run()`.
-
-## Compatibility Notes From PR-Style MegaMoE
-
-PR-style MegaMoE code was written close to the runtime scheduler and often
-hand-authored task pushes, event functions, and persistent resource handling.
-The DSL keeps the same execution concepts but moves them to different layers:
-
-- PR tile/device functions become `TileImpl` classes.
-- PR event tensors become `kernel.event(...)` declarations.
-- PR wait/notify functions become `D(event, coord, inv_coord=...)`.
-- PR dynamic trigger lists become lowering-plan triggers derived from producer
-  notifies and consumer waits on the same event.
-- PR scheduler/event mechanics stay in `transform.lower.scheduler` and
-  `transform.lower.event`, not in user DSL code.
-
-The DSL is therefore not a different execution model.  It is a structured front
-end for the same static/dynamic megakernel runtime ideas.
+actual data dependency before `run()`.  The current dynamic queue still assumes
+that initial entry tasks are sufficient to keep workers from dequeuing empty
+slots; a robust empty-queue protocol is future work.

@@ -1,219 +1,134 @@
 # Megakernel Partition/Event Plan
 
-This document defines the Stage 1 planning artifact used before writing
-`KernelSpec` code.  It is compatible with the current DSL and with PR-style
-MegaMoE workloads where the important first step is to make tile and event
-relationships explicit.
+This document describes how to plan a megakernel before writing `KernelSpec`
+code.  The planning output is intended to be a natural-language design note,
+not a rigid schema.  It should make tile spaces, tensor flow, logical events,
+and producer-consumer dependencies explicit enough that the DSL spec can be
+written and validated.
 
-## Task
+The plan is compatible with the current DSL and with PR-style MegaMoE workloads.
+The key principle is to describe the logical computation and dependency graph
+first, while leaving CUDA atomics, spin waits, mbarriers, queue layout, and TIRX
+statement bodies to the lowering implementation.
 
-Given a staged computation description, produce a logical tile, tensor, and
-event plan.  The plan must be sufficient to write the DSL spec layer, but must
-not include tile implementation bodies or runtime event mechanics.
+## Scope
 
-The plan describes:
+A good plan answers these questions:
 
-1. tile stages;
-2. tile instance spaces;
-3. tensor flow;
-4. logical events;
-5. wait/notify coordinate mappings;
-6. dynamic reverse mappings when an event should push consumer tasks.
+- What are the user-visible computation stages?
+- What tile instances exist for each stage?
+- What tensors does each tile read or write, and what regions are known?
+- Which producer tiles make which consumer tiles ready?
+- Which logical events represent those readiness conditions?
+- How does each producer notify an event coordinate?
+- How does each consumer wait on an event coordinate?
+- For dynamic scheduling, how does one ready event coordinate map back to one
+  or more concrete consumer tile coordinates?
+
+The plan should not include TileImpl code, CUDA source snippets, runtime queue
+implementation, encoded semaphore formulas, or hand-written event mechanics.
+Those belong to `transform.lower`.
 
 ## Inputs
 
-Input may be:
+The input can be Torch-like staged code, an operator graph, pseudocode, an
+existing PR-style megakernel/MegaMoE schedule, or a written staged dataflow
+description.
 
-- Torch-like staged Python code;
-- an operator graph;
-- pseudocode;
-- an existing PR-style megakernel/MegaMoE schedule;
-- a written staged dataflow description;
-- shape and block-size symbols.
+Preserve the staged dataflow unless the user explicitly asks for algebraic
+fusion or simplification.  In MegaMoE-style workloads, routing, expert GEMM,
+reductions, and communication-adjacent stages may have different runtime
+scheduling behavior even when parts of the math could be collapsed.
 
-Preserve the staged dataflow.  If dimensions, block sizes, or split factors are
-missing, introduce symbolic names such as `NUM_BLOCK_M`, `NUM_BLOCK_N`,
-`SPLIT_K`, `NUM_EXPERTS`, or `MAX_TOKENS` instead of inventing constants.
+If a dimension, block size, split factor, expert count, or token bound is not
+specified, introduce a symbolic name such as `NUM_BLOCK_M`, `NUM_BLOCK_N`,
+`SPLIT_K`, `NUM_EXPERTS`, `MAX_TOKENS`, or `TOKENS_PER_EXPERT`.  Do not invent
+concrete constants unless they are given by the workload.
 
-## Output Contract
+## Planning Narrative
 
-Output YAML only unless the user asks for explanation or code.
+The recommended planning note is written as short sections.
 
-Top-level keys:
+First describe the stages.  Each stage should correspond to a tile kind unless
+there is a clear reason to combine stages.  For each stage, state its tile grid
+as `(m, n, k)`, using `1` for unused axes.  Also explain what local computation
+one tile performs.
 
-```yaml
-tiles: {}
-tensors: {}
-events: {}
-dependencies: []
-validation: {}
-```
+Then describe tensors.  Classify each tensor as input, intermediate, output,
+routing, or workspace.  Record which stage produces it, which stages consume it,
+and the shape or symbolic shape if known.  When a tile accesses a known region,
+write the region in terms of its `(m, n, k)` coordinate.  When the region depends
+on runtime routing or cannot be expressed statically, say that the region is
+unknown/dynamic.
 
-Do not output CUDA, TIRX, Relax, Python `KernelSpec`, atomics, spin waits,
-memory fences, mbarrier layout, queue implementation, or encoded event-counter
-formulas.
+Next describe logical events.  Each event is a count tensor.  State the event
+shape, what one event coordinate means, and the `init_count` for each coordinate.
+`init_count` may be a constant, a symbolic expression, or a per-coordinate
+function.  It should equal the number of producer notifications required before
+that event coordinate is ready.
 
-## YAML Schema
-
-```yaml
-tiles:
-  <tile_name>:
-    source_stage: <source stage or expression>
-    purpose: <short description of local computation>
-    tile_impl: <suggested TileImpl class name or null>
-    grid: [<m_tiles>, <n_tiles>, <k_tiles>]
-    index_axes: [m, n, k]
-    reads:
-      - tensor: <tensor_name>
-        region: <optional region expression or dynamic>
-    writes:
-      - tensor: <tensor_name>
-        region: <optional region expression or dynamic>
-
-tensors:
-  <tensor_name>:
-    role: input | intermediate | output | routing | workspace
-    producer: <tile_name_or_null>
-    consumers: [<tile_name>, ...]
-    shape: <shape_or_symbolic_shape_or_null>
-    dtype: <dtype_or_null>
-
-events:
-  <event_name>:
-    kind: count
-    shape: [<event_extent>, ...]
-    init_count: <logical_count_or_expression>
-    dtype: int32
-    meaning: <what readiness condition this event represents>
-
-dependencies:
-  - producer: <producer_tile>
-    consumer: <consumer_tile>
-    tensor: <tensor_name_or_null>
-    event: <event_name>
-    relation: <short producer-consumer relation>
-    notify:
-      tile: <producer_tile>
-      coord: [<event_coord_expr>, ...]
-      notify_num: <number of participating notify workers>
-      remote_rank: <remote rank expression or -1>
-    wait:
-      tile: <consumer_tile>
-      coord: [<event_coord_expr>, ...]
-      expected: <event init count for this coordinate>
-      inv_coord:
-        consumer_num: <fan-out count for one event coordinate>
-        tile_coord: [<m_expr>, <n_expr>, <k_expr>]
-        required_for_dynamic: true | false
-
-validation:
-  status: pass | needs_info
-  checks:
-    - <short completed check>
-  assumptions:
-    - <assumption introduced because input omitted details>
-  questions:
-    - <only include if needed to make the plan actionable>
-```
-
-`event.shape` defines the number of event dimensions.  The length of every
-notify/wait `coord` must match that number when statically known.
+Finally describe dependencies.  For every producer-consumer relationship that
+requires ordering, state the event used, the producer notify mapping, and the
+consumer wait mapping.  In DSL terms, both mappings become `D(event, coord)`
+where `coord(m, n, k, i)` returns `(coord_count, remote_rank, *event_coord)`.
+For dynamic scheduling, also state the inverse mapping used to push consumer
+tasks: `inv_coord(remote_rank, *event_coord, consumer_i)` returns
+`(consumer_count, tile_m, tile_n, tile_k)`.
 
 ## Mapping To DSL
 
-The plan maps to DSL as follows:
+The natural-language plan maps to DSL objects directly:
 
 ```text
-tiles.<name>.grid              -> kernel.tile(..., grid=(m, n, k))
-tensors.<name>                 -> kernel.tensor(...)
-events.<name>.init_count       -> kernel.event(..., init_count=...)
-dependencies[*].notify.coord   -> tile.notify(D(event, coord))
-dependencies[*].wait.coord     -> tile.wait(D(event, coord, inv_coord=...))
+symbolic dimensions      -> kernel.var(...)
+tensor declarations      -> kernel.tensor(...)
+logical events           -> kernel.event(..., init_count=...)
+tile stages              -> kernel.tile(..., grid=(m, n, k), reads=..., writes=...)
+known tensor regions     -> tensor.region(lambda m, n, k: R[...])
+unknown tensor regions   -> bare tensor in reads/writes
+dependencies             -> tile.wait(D(...)) and tile.notify(D(...))
+dynamic reverse mapping  -> inv_coord=... on the waiting dependency
 ```
 
-DSL dependency functions use this exact shape:
+The dependency coordinate function has one form:
 
 ```python
-coord = lambda m, n, k, i: (notify_num, remote_rank, *event_coord)
-inv_coord = lambda remote_rank, *event_coord, consumer_i: (
-    consumer_num,
-    consumer_m,
-    consumer_n,
-    consumer_k,
-)
+coord = lambda m, n, k, i: (coord_count, remote_rank, *event_coord)
 ```
 
-For batch notifies, `notify_num` must stay stable for every `notify_i`, each
-produced event coordinate must be inside the event shape, and one tile notify
-must not produce duplicate `(remote_rank, event_coord)` entries when statically
-checkable.
+For waits, the coordinate must describe one local event coordinate:
 
-For a wait, `coord(m, n, k, 0)` must describe exactly one local coordinate:
-`notify_num == 1` and `remote_rank == -1`.
+```text
+coord_count == 1
+remote_rank == -1
+```
 
-For dynamic scheduling, every wait that can be triggered by a producer must have
-`inv_coord`.  When statically checkable, each generated consumer coord must
-round-trip through the wait `coord`, stay inside the consumer grid, and be
-unique for that event coord.  Static scheduling may omit `inv_coord`.
+For notifies, `coord_count` tells lowering how many event coordinates this
+one tile notify expands to.  If `coord_count > 1`, validation checks every
+`notify_i` when the mapping is statically provable.  `coord_count` must be
+stable, event coordinates must be inside the event shape, and one tile notify
+must not generate duplicate `(remote_rank, event_coord)` entries.
 
-## Planning Procedure
+For dynamic scheduling, every wait that can be triggered by a producer must
+provide `inv_coord`.  When statically provable, validation checks that each
+consumer coordinate generated by `inv_coord` is inside the consumer grid,
+round-trips through the wait `coord`, and is unique for that event coordinate.
+If dependency routing uses runtime tensor indexing, these static proofs are
+skipped with warnings and must be covered by workload tests.
 
-1. Identify user-visible stages in order.
-2. Assign one tile stage per preserved stage.
-3. Choose each tile grid using `[m, n, k]`; use `1` for unused axes.
-4. Record reads and writes for every tile, with known regions when possible.
-5. Build tensor producer/consumer metadata.
-6. Classify every producer-consumer edge: one-to-one, many-to-one,
-   one-to-many, many-to-many, or runtime-routed.
-7. Create count events for readiness that cannot be represented by pure stage
-   order.
-8. Define notify event coordinates from producer tile coordinates.
-9. Define wait event coordinates from consumer tile coordinates.
-10. For dynamic scheduling, define `inv_coord` from event coordinates back to
-    consumer tile coordinates.
-11. Validate event dimensions, logical counts, tensor flow, and staged dataflow
-    preservation.
-12. Return YAML only.
-
-## Dependency Patterns
+## Common Patterns
 
 ### One-To-One
 
-Producer tile `(m, n, k)` enables consumer tile `(m, n, k)`.
+A producer tile `(m, n, k)` enables the matching consumer tile `(m, n, k)`.
+Use an event shaped like the tile grid.  The producer notifies event coordinate
+`(m, n, k)`, and the consumer waits on the same coordinate.  The event
+`init_count` is usually `1`.
 
-```yaml
-events:
-  ready:
-    kind: count
-    shape: [NUM_M, NUM_N, NUM_K]
-    init_count: 1
-    dtype: int32
-    meaning: producer tile result is ready
-
-dependencies:
-  - producer: producer
-    consumer: consumer
-    tensor: tmp
-    event: ready
-    relation: same m,n,k
-    notify:
-      tile: producer
-      coord: [m, n, k]
-      notify_num: 1
-      remote_rank: -1
-    wait:
-      tile: consumer
-      coord: [m, n, k]
-      expected: 1
-      inv_coord:
-        consumer_num: 1
-        tile_coord: [m, n, k]
-        required_for_dynamic: true
-```
-
-DSL:
+DSL shape:
 
 ```python
+ready = kernel.event("ready", (M, N, K), init_count=1)
 producer.notify(D(ready, lambda m, n, k, i: (1, -1, m, n, k)))
 consumer.wait(D(
     ready,
@@ -224,102 +139,76 @@ consumer.wait(D(
 
 ### Many-To-One Reduction
 
-Producer tile space `(m, n, 1)` enables one consumer tile `(m, 0, 0)` after all
-`n` producers for the same `m` are ready.
+A tile space `(m, n, 1)` produces partial results, and one consumer tile
+`(m, 0, 0)` can run after all `n` producers for the same `m` are ready.  Use an
+event shaped `(M,)`.  Each producer notifies `row_ready[m]`; the event
+`init_count` is `N` or the symbolic variable representing the number of `n`
+tiles.
 
-```yaml
-events:
-  row_ready:
-    kind: count
-    shape: [NUM_M]
-    init_count: NUM_N
-    dtype: int32
-    meaning: all n-block producers for one m are ready
+DSL shape:
 
-dependencies:
-  - producer: partial
-    consumer: final
-    tensor: partial_out
-    event: row_ready
-    relation: producer.m == consumer.m, all producer.n
-    notify:
-      tile: partial
-      coord: [m]
-      notify_num: 1
-      remote_rank: -1
-    wait:
-      tile: final
-      coord: [m]
-      expected: NUM_N
-      inv_coord:
-        consumer_num: 1
-        tile_coord: [m, 0, 0]
-        required_for_dynamic: true
+```python
+row_ready = kernel.event("row_ready", (M,), init_count=N)
+partial.notify(D(row_ready, lambda m, n, k, i: (1, -1, m)))
+final.wait(D(
+    row_ready,
+    lambda m, n, k, i: (1, -1, m),
+    inv_coord=lambda remote_rank, m, ci: (1, m, 0, 0),
+))
 ```
 
-### One-To-Many / Runtime Routed
+### One-To-Many Or Runtime Routed
 
-One ready event coordinate pushes multiple consumers.  This is common in
-MegaMoE-style routing, where a runtime routing tensor maps event coordinates to
-consumer tile coordinates.
+One ready event coordinate may enable multiple consumer tiles.  This is common
+for MegaMoE-style routing, where a runtime routing tensor maps experts or token
+blocks to consumer work.
 
-```yaml
-events:
-  expert_ready:
-    kind: count
-    shape: [NUM_EXPERTS]
-    init_count: <producer_count_per_expert>
-    dtype: int32
-    meaning: all inputs for one expert are ready
+The plan should state what one event coordinate represents, how many consumers
+it may fan out to, and how `consumer_i` selects one concrete consumer tile.
+The DSL may use runtime tensor indexing inside dependency coordinate closures;
+validation will warn when it cannot statically prove dimension or round-trip
+properties.
 
-dependencies:
-  - producer: dispatch
-    consumer: expert_gemm
-    tensor: routed_tokens
-    event: expert_ready
-    relation: runtime routing maps expert id to token tiles
-    notify:
-      tile: dispatch
-      coord: [expert_id_from_routing]
-      notify_num: 1
-      remote_rank: -1
-    wait:
-      tile: expert_gemm
-      coord: [expert_id]
-      expected: <producer_count_per_expert>
-      inv_coord:
-        consumer_num: tokens_per_expert(expert_id)
-        tile_coord: [token_for_expert(expert_id, consumer_i), expert_id, 0]
-        required_for_dynamic: true
+DSL shape:
+
+```python
+expert.wait(D(
+    expert_ready,
+    lambda m, n, k, i: (1, -1, expert_id_for_tile(m, n)),
+    inv_coord=lambda remote_rank, expert_id, ci: (
+        tokens_per_expert(expert_id),
+        token_for_expert(expert_id, ci),
+        expert_id,
+        0,
+    ),
+))
 ```
 
-In DSL this may use runtime tensor indexing inside `coord` or `inv_coord`.  The
-validator will skip static proofs it cannot make and emit warnings; workload
-coverage must prove the runtime path.
+## Dynamic Scheduler Notes
 
-## Dynamic Scheduler Planning Notes
+For dynamic scheduling, entry tiles are inferred from the dependency graph: they
+are tiles with no waits.  A producer notify on event `E` can push any consumer
+tile that waits on `E` and provides `inv_coord`.  The endpoint tile is inferred
+as a tile with no notifies; the current lowering expects one endpoint tile, and
+its grid should be one tile when statically known.
 
-For dynamic scheduling, the plan must identify entry tiles and one endpoint tile
-indirectly through the dependency graph:
-
-- Entry tiles have no waits and are inserted by the dynamic queue-init kernel.
-- A producer notify on event `E` can push any consumer tile that waits on `E` and
-  provides `inv_coord`.
-- The current lowering supports at most one wait dependency per dynamic tile.
-- The current lowering requires exactly one endpoint tile, and that endpoint
-  grid must be one tile when statically known.
-
-Do not model pre-notify or complete-notify as separate DSL events.  They are the
-lowering implementation of one logical notify dependency.
+The current dynamic queue implementation has one important limitation: it does
+not yet have a robust empty-queue protocol.  The initial entry-task count must
+be large enough relative to `sm_count`, otherwise workers may dequeue empty
+slots and terminate early.  This is a lowering/runtime limitation, not a DSL
+semantic requirement.
 
 ## Validation Checklist
 
-A good plan should state that it checked:
+Before writing or lowering the DSL, the plan should make these checks clear:
 
-- every tile has a three-dimensional `[m, n, k]` grid;
-- every tensor consumer has a producer or the tensor is an input/routing tensor;
-- event coordinate length matches event dimensions;
+- every tile grid is three-dimensional `(m, n, k)`;
+- every tensor read has a producer or is an input/routing tensor;
+- known tensor regions have the same number of dimensions as the tensor;
+- event coordinate length matches the event dimensions;
 - `init_count` matches the number of producer notifies per event coordinate;
-- dynamic waits that need scheduling have `inv_coord`;
-- one-to-many `inv_coord` includes a fan-out count;
-- staged dataflow from the input is preserved.
+- dynamic waits that should be producer-triggered have `inv_coord`;
+- one-to-many `inv_coord` includes a stable fan-out count;
+- statically checkable `inv_coord` mappings round-trip through the wait mapping;
+- runtime-routed mappings are called out as requiring workload coverage;
+- the staged dataflow from the original computation is preserved.
