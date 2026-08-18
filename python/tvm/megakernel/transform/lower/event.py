@@ -264,7 +264,7 @@ def dependency_info_from_map(
     if not isinstance(info, (tuple, list)):
         raise TypeError(f"dependency coord must return tuple/list, got {info!r}")
     if len(info) < 2:
-        raise ValueError("dependency coord must return (notify_num, rank, *event_coord)")
+        raise ValueError("dependency coord must return (coord_count, rank, *event_coord)")
     return tuple(info)
 
 

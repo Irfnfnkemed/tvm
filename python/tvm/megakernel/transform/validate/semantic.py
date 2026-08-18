@@ -31,7 +31,7 @@ Validation performed by this module, in call order:
    - A tile may have at most one wait edge and one notify edge per logical event.
    - Wait/notify coord mappings must return tuple/list values with the same
      number of dimensions as the target event shape.
-   - notify_num and rank may only use integers, Vars, and ExprSpecs owned by
+   - coord_count and rank may only use integers, Vars, and ExprSpecs owned by
      the same KernelSpec.
    - Event coord expressions may also be lower-time/runtime values.  Runtime
      event coords keep shape checks but skip semantic checks that require exact
@@ -659,7 +659,7 @@ def _dependency_info_from_map(
     if not isinstance(mapped, (tuple, list)):
         raise TypeError(f"dependency coord must return tuple/list, got {mapped!r}")
     if len(mapped) < 2:
-        raise ValueError("dependency coord must return (notify_num, rank, *event_coord)")
+        raise ValueError("dependency coord must return (coord_count, rank, *event_coord)")
     return tuple(mapped)
 
 
@@ -753,20 +753,20 @@ def _validate_dependency_shape(
     info = _dependency_info_from_map(dependency.coord, *sample, 0, tensor_ids=tensor_ids)
     if info is None:
         return
-    notify_num, rank, *coord = info
+    coord_count, rank, *coord = info
     if len(coord) != dim:
         raise ValueError(
             f"{label} coord has {len(coord)} dims, but event {event.name!r} has {dim} dims"
         )
-    if not _is_expr_like(notify_num):
-        raise TypeError(f"{label} notify_num contains unsupported value {notify_num!r}")
+    if not _is_expr_like(coord_count):
+        raise TypeError(f"{label} coord_count contains unsupported value {coord_count!r}")
     if not _is_expr_like(rank):
         raise TypeError(f"{label} rank contains unsupported value {rank!r}")
-    if is_wait and notify_num != 1:
-        raise ValueError(f"{label} wait dependency must have notify_num == 1")
+    if is_wait and coord_count != 1:
+        raise ValueError(f"{label} wait dependency must have coord_count == 1")
     if is_wait and rank != -1:
         raise ValueError(f"{label} wait dependency must have rank == -1")
-    values = [notify_num, rank]
+    values = [coord_count, rank]
     for value in coord:
         if not _is_expr_like(value):
             raise TypeError(f"{label} coord contains unsupported value {value!r}")
@@ -807,10 +807,10 @@ def _validate_event_counts_for_shape(
                 info = _dependency_info_from_map(coord, *idx, 0)
                 if info is None:
                     return
-                notify_num = _resolve_expr_value(info[0], env)
-                if isinstance(notify_num, bool) or not isinstance(notify_num, int) or notify_num < 1:
-                    raise ValueError(f"{producer.name}.notify notify_num must be a positive integer")
-                for notify_i in range(notify_num):
+                coord_count = _resolve_expr_value(info[0], env)
+                if isinstance(coord_count, bool) or not isinstance(coord_count, int) or coord_count < 1:
+                    raise ValueError(f"{producer.name}.notify coord_count must be a positive integer")
+                for notify_i in range(coord_count):
                     coord_value = _static_dependency_coord(
                         dependency, *idx, notify_i=notify_i, env=env, tensor_ids=tensor_ids
                     )

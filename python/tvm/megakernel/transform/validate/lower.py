@@ -47,8 +47,8 @@ Validation performed by this module, in call order:
    - Dynamic lowering currently requires exactly one endpoint tile, and that
      endpoint grid must contain exactly one tile when statically known.
    - Notify/wait coord mappings must match the target event dimensions when
-     statically checkable.  For statically checkable batch-notify coords, every
-     notify_i entry must keep a stable notify_num, stay inside the event shape,
+     statically checkable.  For statically checkable multi-coordinate notify mappings, every
+     notify_i entry must keep a stable coord_count, stay inside the event shape,
      and avoid duplicate event notifications within the same tile notify.
    - Dynamic waits must provide inv_coord.  For statically checkable wait
      coords, every fan-out consumer returned by inv_coord must round-trip
@@ -275,17 +275,17 @@ def _validate_notify_coord(coord_fn, event_shape: tuple) -> None:
     first_info = coord_fn(*sample_tile_coord, 0)
     if not isinstance(first_info, (tuple, list)) or len(first_info) != len(event_shape) + 2:
         raise ValueError("dynamic schedule notify coord dim must match event dim")
-    notify_num = first_info[0]
-    if isinstance(notify_num, bool) or not isinstance(notify_num, int) or notify_num < 1:
-        raise ValueError("dynamic schedule notify coord notify_num must be a positive integer")
+    coord_count = first_info[0]
+    if isinstance(coord_count, bool) or not isinstance(coord_count, int) or coord_count < 1:
+        raise ValueError("dynamic schedule notify coord_count must be a positive integer")
 
     seen_notifications = set()
-    for notify_i in range(notify_num):
+    for notify_i in range(coord_count):
         info = coord_fn(*sample_tile_coord, notify_i)
         if not isinstance(info, (tuple, list)) or len(info) != len(event_shape) + 2:
             raise ValueError("dynamic schedule notify coord dim must match event dim")
-        if info[0] != notify_num:
-            raise ValueError("dynamic schedule notify coord notify_num must be stable")
+        if info[0] != coord_count:
+            raise ValueError("dynamic schedule notify coord_count must be stable")
         rank = info[1]
         event_coord = tuple(info[2:])
         _validate_event_coord_in_shape(event_coord, event_shape)
@@ -322,11 +322,11 @@ def _validate_inv_coord(
     first_info = inv_coord(-1, *event_coord, 0)
     if not isinstance(first_info, (tuple, list)) or len(first_info) != 4:
         raise ValueError(
-            "dynamic schedule inv_coord must return (consumer_num, tile_m, tile_n, tile_k)"
+            "dynamic schedule inv_coord must return (consumer_count, tile_m, tile_n, tile_k)"
         )
-    consumer_num = first_info[0]
-    if isinstance(consumer_num, bool) or not isinstance(consumer_num, int) or consumer_num < 1:
-        raise ValueError("dynamic schedule inv_coord consumer_num must be a positive integer")
+    consumer_count = first_info[0]
+    if isinstance(consumer_count, bool) or not isinstance(consumer_count, int) or consumer_count < 1:
+        raise ValueError("dynamic schedule inv_coord consumer_count must be a positive integer")
     if not coord_is_static:
         warnings.warn(
             "dynamic schedule wait coord uses runtime TensorSpec indexing; "
@@ -337,14 +337,14 @@ def _validate_inv_coord(
         return
 
     seen_consumer_idx = set()
-    for consumer_i in range(consumer_num):
+    for consumer_i in range(consumer_count):
         consumer_info = inv_coord(-1, *event_coord, consumer_i)
         if not isinstance(consumer_info, (tuple, list)) or len(consumer_info) != 4:
             raise ValueError(
-                "dynamic schedule inv_coord must return (consumer_num, tile_m, tile_n, tile_k)"
+                "dynamic schedule inv_coord must return (consumer_count, tile_m, tile_n, tile_k)"
             )
-        if consumer_info[0] != consumer_num:
-            raise ValueError("dynamic schedule inv_coord consumer_num must be stable")
+        if consumer_info[0] != consumer_count:
+            raise ValueError("dynamic schedule inv_coord consumer_count must be stable")
         consumer_idx = tuple(consumer_info[1:])
         _validate_consumer_idx_in_grid(consumer_idx, consumer_grid)
         if consumer_idx in seen_consumer_idx:

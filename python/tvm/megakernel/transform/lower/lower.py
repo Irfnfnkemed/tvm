@@ -826,13 +826,13 @@ class _TileEventEmitter:
                     )
                     rank = notify_info[1]
                     event_coord = notify_info[2:]
-                    consumer_num, consumer_m_idx, consumer_n_idx, consumer_k_idx = (
+                    consumer_count, consumer_m_idx, consumer_n_idx, consumer_k_idx = (
                         _LoweringUtils.consumer_task_info_from_event(
                             trigger, rank, event_coord, consumer_i
                         )
                     )
                     return (
-                        consumer_num,
+                        consumer_count,
                         _LoweringUtils.pack_task(
                             consumer_m_idx,
                             consumer_n_idx,
@@ -905,7 +905,7 @@ class _LoweringUtils:
             raise ValueError("dynamic trigger requires inv_coord")
         info = inv_coord(rank, *event_coord, consumer_i)
         if not isinstance(info, (tuple, list)) or len(info) != 4:
-            raise TypeError("inv_coord must produce (consumer_num, tile_m, tile_n, tile_k)")
+            raise TypeError("inv_coord must produce (consumer_count, tile_m, tile_n, tile_k)")
         return tuple(info)
 
 

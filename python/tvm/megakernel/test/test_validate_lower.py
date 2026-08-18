@@ -157,8 +157,8 @@ def _batch_notify_dynamic_kernel(coord, init_count=None):
     return kernel
 
 
-def test_dynamic_rejects_duplicate_batch_notify_event_coords():
-    """Reject batch notify mappings that notify the same event coord twice."""
+def test_dynamic_rejects_duplicate_multi_coord_notify_event_coords():
+    """Reject notify mappings that generate the same event coord twice."""
     kernel = _batch_notify_dynamic_kernel(lambda m, n, k, i: (2, -1, 0))
 
     plan = _dynamic_plan(kernel)
@@ -166,12 +166,12 @@ def test_dynamic_rejects_duplicate_batch_notify_event_coords():
         validate_lowering_plan(plan)
 
 
-def test_dynamic_rejects_unstable_batch_notify_num():
-    """Reject batch notify mappings whose notify_num changes across notify_i."""
+def test_dynamic_rejects_unstable_notify_coord_count():
+    """Reject notify mappings whose coord_count changes across notify_i."""
     kernel = _batch_notify_dynamic_kernel(lambda m, n, k, i: (2 if i == 0 else 1, -1, i), init_count=1)
 
     plan = _dynamic_plan(kernel)
-    with pytest.raises(ValueError, match="notify_num must be stable"):
+    with pytest.raises(ValueError, match="coord_count must be stable"):
         validate_lowering_plan(plan)
 
 def _fanout_dynamic_kernel(inv_coord):

@@ -282,7 +282,7 @@ class StaticTileScheduler:
     ) -> None:
         """Notify an event semaphore under the static scheduling policy."""
 
-        max_notify_num_map = T.meta_var(
+        max_coord_count_map = T.meta_var(
             {
                 "thread": 1,
                 "warp": 32,
@@ -319,12 +319,12 @@ class StaticTileScheduler:
         if scope_id == -1 or idx[0] == scope_id:
             self._sync_notify_scope(scope, scope_id)
             notify_info = T.meta_var(func_notify(idx[1]))
-            notify_num = notify_info[0]
+            coord_count = notify_info[0]
             rank = notify_info[1]
             coord = T.meta_var(notify_info[2:])
             if self.debug:
-                T.cuda.trap_when_assert_failed(notify_num <= max_notify_num_map[scope])
-            if idx[1] < notify_num:
+                T.cuda.trap_when_assert_failed(coord_count <= max_coord_count_map[scope])
+            if idx[1] < coord_count:
                 semaphore.semaphore_notify(*coord, rank=rank, release=release)
 
     @T.inline
@@ -573,7 +573,7 @@ class DynamicTileScheduler:
         scope: str = "cta",
         scope_id: int = 0,
     ) -> None:
-        max_notify_num_map = T.meta_var(
+        max_coord_count_map = T.meta_var(
             {
                 "thread": 1,
                 "warp": 32,
@@ -626,19 +626,19 @@ class DynamicTileScheduler:
             T.cuda.trap_when_assert_failed(scope_id == -1 or scope_id < max_scope_id_map[scope])
         if idx[0] == new_scope_id:
             notify_info = T.meta_var(func_notify(idx[1]))
-            notify_num = notify_info[0]
+            coord_count = notify_info[0]
             rank = notify_info[1]
             coord = T.meta_var(notify_info[2:])
             if self.debug:
-                T.cuda.trap_when_assert_failed(notify_num <= max_notify_num_map[scope])
-            if idx[1] < notify_num:
+                T.cuda.trap_when_assert_failed(coord_count <= max_coord_count_map[scope])
+            if idx[1] < coord_count:
                 semaphore.semaphore_pre_notify(*coord, rank=rank)
                 self.semaphore_state[tid] = semaphore.state[0]
             else:
                 self.semaphore_state[tid] = 0
             T.tvm_storage_sync("shared")
             if push_level == "thread":
-                if idx[1] < notify_num:
+                if idx[1] < coord_count:
                     semaphore.state[0] = self.semaphore_state[tid]
                     if semaphore.is_triggered():
                         notify_i = idx[1]
@@ -650,7 +650,7 @@ class DynamicTileScheduler:
                         )
             elif scope == "warp" and push_level == "warp":
                 self.push_idx[0] = idx_in_scope_map[scope][push_level]
-                while self.push_idx[0] < notify_num:
+                while self.push_idx[0] < coord_count:
                     semaphore.state[0] = self.semaphore_state[new_scope_id * 32 + self.push_idx[0]]
                     if semaphore.is_triggered():
                         notify_i = self.push_idx[0]
@@ -663,7 +663,7 @@ class DynamicTileScheduler:
                     self.push_idx[0] = self.push_idx[0] + stride_in_scope_map[scope][push_level]
             elif scope == "warpgroup" and (push_level == "warp" or push_level == "warpgroup"):
                 self.push_idx[0] = idx_in_scope_map[scope][push_level]
-                while self.push_idx[0] < notify_num:
+                while self.push_idx[0] < coord_count:
                     semaphore.state[0] = self.semaphore_state[
                         new_scope_id * self.warpgroup_size + self.push_idx[0]
                     ]
@@ -678,7 +678,7 @@ class DynamicTileScheduler:
                     self.push_idx[0] = self.push_idx[0] + stride_in_scope_map[scope][push_level]
             elif scope == "cta" and (push_level == "warp" or push_level == "warpgroup" or push_level == "cta"):
                 self.push_idx[0] = idx_in_scope_map[scope][push_level]
-                while self.push_idx[0] < notify_num:
+                while self.push_idx[0] < coord_count:
                     semaphore.state[0] = self.semaphore_state[self.push_idx[0]]
                     if semaphore.is_triggered():
                         notify_i = self.push_idx[0]
@@ -703,7 +703,7 @@ class DynamicTileScheduler:
         scope_id: int = 0,
         release: bool = False,
     ) -> None:
-        max_notify_num_map = T.meta_var(
+        max_coord_count_map = T.meta_var(
             {
                 "thread": 1,
                 "warp": 32,
@@ -738,12 +738,12 @@ class DynamicTileScheduler:
         if scope_id == -1 or idx[0] == scope_id:
             StaticTileScheduler._sync_notify_scope(self, scope, scope_id)
             notify_info = T.meta_var(func_notify(idx[1]))
-            notify_num = notify_info[0]
+            coord_count = notify_info[0]
             rank = notify_info[1]
             coord = T.meta_var(notify_info[2:])
             if self.debug:
-                T.cuda.trap_when_assert_failed(notify_num <= max_notify_num_map[scope])
-            if idx[1] < notify_num:
+                T.cuda.trap_when_assert_failed(coord_count <= max_coord_count_map[scope])
+            if idx[1] < coord_count:
                 semaphore.semaphore_complete_notify(*coord, rank=rank, release=release)
 
     def valid(self):
