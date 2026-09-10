@@ -148,6 +148,7 @@ class CUDANamespace:
         self.mov_sreg: Callable[..., Any] = _op_wrapper(_cuda_op.cuda_mov_sreg)
         # Spin-until-ready mbarrier waits: label-loop asm blocks, not single
         # PTX instructions -- which is why they live here and not in T.ptx.
+        self.ld_until = _op_wrapper(_cuda_op.cuda_ld_until)
         self.mbarrier_wait = _op_wrapper(_cuda_op.cuda_mbarrier_wait)
         self.mbarrier_wait_acquire_cluster = _op_wrapper(
             _cuda_op.cuda_mbarrier_wait_acquire_cluster
