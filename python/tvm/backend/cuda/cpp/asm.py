@@ -25,12 +25,105 @@ the PTX text, or the offset-scaling ``cp.async`` form the legacy
 ``InjectPTXAsyncCopy`` pass emits.
 """
 
+from tvm import ir, tirx
 from tvm.backend.cuda.op import cuda_func_call
+from tvm.tirx.stmt_functor import StmtExprVisitor
 
 from ..codegen.registry import CODEGEN_REGISTRY, register_codegen
 from ..codegen.schema import device_intrinsic
 from ..codegen.types import PTXDataType
 from ..codegen.utils import parse_str
+
+
+@register_codegen("cuda_ld_until")
+def cuda_ld_until(dst, ptr, condition, order, scope, space):
+    """Lower a pre-tested scoped wait through the ordinary CUDA function call."""
+    if not isinstance(dst, ir.TensorLoad) or dst.source.scope() not in {
+        "local",
+        "local_scalar",
+        "register",
+        "reg",
+    }:
+        raise TypeError("ld_until dst must be a writable thread-local scalar")
+    dtype = str(dst.ty)
+    if dtype not in {"uint32", "uint64"}:
+        raise TypeError("ld_until dst must have scalar uint32 or uint64 type")
+    if not isinstance(ptr.ty, ir.PointerType) or ptr.ty.element_type != dst.ty:
+        raise TypeError("ld_until ptr must point to the destination's scalar type")
+    order, scope, space = (parse_str(x) for x in (order, scope, space))
+    if order not in {"relaxed", "acquire"}:
+        raise ValueError("ld_until order must be relaxed or acquire")
+    if scope not in {"cta", "cluster", "gpu", "sys"}:
+        raise ValueError("ld_until scope must be cta, cluster, gpu, or sys")
+    if space not in {"global", "shared::cta", "shared::cluster"}:
+        raise ValueError("ld_until space must be global, shared::cta, or shared::cluster")
+    if not isinstance(condition, ir.Expr) or str(condition.ty) != "bool":
+        raise TypeError("ld_until predicate must produce a scalar boolean IR expression")
+
+    class CheckExpr(StmtExprVisitor):
+        def __init__(self, allow_dst):
+            super().__init__()
+            self.allow_dst = allow_dst
+
+        def visit_expr(self, node):
+            # The macro must receive an inline expression, not a temporary
+            # materialized before the call by vector/Let/conditional codegen.
+            if self.allow_dst and (
+                isinstance(node, tirx.Let)
+                or str(node.ty) not in {"bool", "int32", "uint32", "int64", "uint64"}
+            ):
+                raise ValueError("ld_until predicate requires scalar 32/64-bit integer expressions")
+            super().visit_expr(node)
+
+        def visit_buffer_load_(self, node):
+            if not (self.allow_dst and tirx.analysis.expr_deep_equal(node, dst)):
+                raise ValueError("ld_until expressions may not read memory other than dst")
+            super().visit_buffer_load_(node)
+
+        def visit_call_(self, node):
+            if not isinstance(node.op, ir.Op):
+                raise ValueError("ld_until expressions must be free of effectful calls")
+            if node.op.name == "tirx.address_of" and len(node.args) == 1:
+                addressed = node.args[0]
+                if isinstance(addressed, ir.TensorLoad):
+                    for index in addressed.indices:
+                        self.visit_expr(index)
+                    return
+            if node.op.get_attr("TCallEffectKind") != tirx.CallEffectKind.Pure.value:
+                raise ValueError("ld_until expressions must be free of effectful calls")
+            if self.allow_dst and node.op.name not in {
+                "ir.prim.bitwise_and",
+                "ir.prim.bitwise_or",
+                "ir.prim.bitwise_xor",
+                "ir.prim.bitwise_not",
+                "ir.prim.shift_left",
+                "ir.prim.shift_right",
+                "tirx.large_uint_imm",
+            }:
+                raise ValueError("ld_until predicate calls must be scalar bitwise operations")
+            super().visit_call_(node)
+
+    CheckExpr(allow_dst=True).visit_expr(condition)
+    invariant = CheckExpr(allow_dst=False)
+    invariant.visit_expr(ptr)
+    for index in dst.indices:
+        invariant.visit_expr(index)
+
+    from ..ptx import PTXNamespace  # pylint: disable=import-outside-toplevel
+
+    # Reuse the load's instruction-table validation and address conversion.
+    load = PTXNamespace()[f"ld.{order}.{scope}.{space}.u{dtype[4:]}"](dst, ptr)
+    load_call, tags = CODEGEN_REGISTRY[load.op.name](load.args)
+    load_name = parse_str(load_call.args[0])
+    name = load_name.replace("ptx_ld_", "cuda_ld_until_")
+    source = load_call.args[-1].value.replace(load_name, name + "_load")
+    # Keep the predicate expression at the call site: an ordinary bool argument
+    # would be evaluated only once, before the load updates the destination.
+    source += (
+        f"\n#define {name}(dst, ptr, predicate) "
+        f"do {{ while (!(predicate)) {{ {name}_load((dst), (ptr)); }} }} while (0)\n"
+    )
+    return cuda_func_call(name, *load_call.args[1:-1], condition, source_code=source), tags
 
 
 # =============================================================================

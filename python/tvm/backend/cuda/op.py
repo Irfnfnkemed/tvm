@@ -395,6 +395,50 @@ def _validate_mbarrier_arrive_attrs(sem, scope, space, remote):
         raise ValueError("remote mbarrier.arrive requires space='shared::cluster'")
 
 
+def cuda_ld_until(dst, ptr, predicate, order, scope, space):
+    """Load into ``dst`` until ``predicate`` is true.
+
+    ``dst`` is an initialized thread-local uint32/uint64 scalar destination.
+    Its current value is tested first, so an already satisfied predicate
+    performs no load. Otherwise each iteration performs one scoped PTX load
+    and tests the resulting value. The final value remains in ``dst``.
+
+    ``predicate`` is a scalar boolean IR expression referring to ``dst``.
+    A trace-time callable is also accepted as a convenience: it is called
+    once with the destination IR expression to construct the predicate.
+    No callable is stored in the IR or invoked on the device. In either form,
+    lowering places the expression inside the loop so it is reevaluated
+    after each load. Supported predicates use scalar
+    32/64-bit integer arithmetic, casts, comparisons, boolean and bitwise
+    operations. They may read ``dst`` and immutable scalar expressions, but
+    no other memory or effectful operations. Let bindings and calls other
+    than bitwise operations are not supported.
+
+    ``order`` (relaxed/acquire), ``scope`` (cta/cluster/gpu/sys), and ``space``
+    (global/shared::cta/shared::cluster) are explicit compile-time strings.
+    The address must remain fixed during the wait and be naturally aligned.
+    Each load retains its PTX memory semantics; the loop is not atomic and a
+    relaxed wait does not itself establish release/acquire synchronization.
+
+    Examples
+    --------
+    .. code-block:: python
+
+        T.cuda.ld_until(
+            observed[0], slot.ptr_to([0]),
+            predicate=T.Cast("uint32", observed[0] >> 32) == T.uint32(GEN),
+            order="relaxed", scope="cluster", space="global",
+        )
+
+    Equivalently, the predicate can be written as
+    ``lambda v: T.Cast("uint32", v >> 32) == T.uint32(GEN)``.
+    """
+    if tirx.is_buffer_var(dst):
+        dst = dst[0]
+    condition = tirx.convert(predicate(dst) if callable(predicate) else predicate)
+    return call_intrin("", "tirx.cuda.ld_until", dst, ptr, condition, order, scope, space)
+
+
 def cuda_mbarrier_wait(bar, phase):
     """Retry ``mbarrier.try_wait.parity.acquire.cta`` until it returns true.
 
